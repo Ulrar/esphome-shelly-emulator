@@ -21,6 +21,9 @@ CONF_PROFILE = "profile"
 CONF_WIFI_SSID = "wifi_ssid"
 CONF_TRIGGER_ID = "trigger_id"
 CONF_ON_SWITCH_STATE = "on_switch_state"
+CONF_DEVICES = "devices"
+CONF_NAME = "name"
+CONF_HOSTNAME = "hostname"
 
 shelly_ns = cg.esphome_ns.namespace("shelly_emulator")
 ShellyEmulator = shelly_ns.class_("ShellyEmulator", cg.Component)
@@ -38,6 +41,21 @@ CHANNEL_SCHEMA = cv.Schema(
         cv.Optional("output_switch"): cv.use_id(switch.Switch),
     }
 )
+DEVICE_SCHEMA = cv.Schema(
+    {
+        cv.Required(CONF_NAME): cv.string,
+        cv.Required(CONF_HOSTNAME): cv.All(
+            cv.string,
+            cv.Length(min=1, max=20),
+            cv.matches_regex(r"^[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?$"),
+        ),
+        cv.Optional(CONF_PROFILE, default="auto"): cv.one_of(
+            "auto", "plus1pm", "plus2pm", "pro4pm", "em_gen3", lower=True
+        ),
+        cv.Required(CONF_CHANNELS): cv.All(cv.ensure_list(CHANNEL_SCHEMA), cv.Length(min=1, max=4)),
+        cv.Optional(CONF_WIFI_SSID, default="Ethernet"): cv.string,
+    }
+)
 
 CONFIG_SCHEMA = cv.Schema(
     {
@@ -45,6 +63,7 @@ CONFIG_SCHEMA = cv.Schema(
         cv.Optional(CONF_ENABLE_BLE, default=False): cv.boolean,
         cv.Optional(CONF_BLE_SERVER_ID): cv.use_id(esp32_ble_server.BLEServer),
         cv.Optional(CONF_CHANNELS): cv.All(cv.ensure_list(CHANNEL_SCHEMA), cv.Length(min=1, max=4)),
+        cv.Optional(CONF_DEVICES): cv.All(cv.ensure_list(DEVICE_SCHEMA), cv.Length(min=2, max=4)),
         # Legacy single-channel sensor keys. These are normalized to channels[0].
         cv.Optional(CONF_POWER_SENSOR): cv.use_id(sensor.Sensor),
         cv.Optional(CONF_VOLTAGE_SENSOR): cv.use_id(sensor.Sensor),
@@ -63,12 +82,12 @@ CONFIG_SCHEMA = cv.Schema(
 ).extend(cv.COMPONENT_SCHEMA)
 
 
-def resolve_profile(config):
+def resolve_profile(config, has_switch_trigger=False):
     channels = config.get(CONF_CHANNELS)
     if channels is None:
         channels = [config]
     channel_count = len(channels)
-    has_controls = bool(config.get(CONF_ON_SWITCH_STATE)) or any(
+    has_controls = has_switch_trigger or bool(config.get(CONF_ON_SWITCH_STATE)) or any(
         "output_switch" in channel for channel in channels
     )
 
@@ -103,17 +122,32 @@ def validate_config(config):
         CONF_CURRENT_SENSOR,
         CONF_ENERGY_SENSOR,
     )
-    if CONF_CHANNELS in config:
-        if any(key in config for key in legacy_sensor_keys):
-            raise cv.Invalid("Use either channels or the legacy top-level sensor keys, not both")
-        if len(config[CONF_CHANNELS]) not in (1, 2, 4):
-            raise cv.Invalid("channels must contain 1, 2, or 4 entries to match a supported Shelly model")
+    if CONF_DEVICES in config:
+        if CONF_CHANNELS in config or any(key in config for key in legacy_sensor_keys):
+            raise cv.Invalid("Use either devices or channels and top-level sensors, not both")
+        if not config[CONF_ENABLE_BLE]:
+            raise cv.Invalid("enable_ble is required when configuring multiple virtual Shelly devices")
+        devices = config[CONF_DEVICES]
+        names = [device[CONF_NAME].casefold() for device in devices]
+        hostnames = [device[CONF_HOSTNAME].casefold() for device in devices]
+        if len(set(names)) != len(names):
+            raise cv.Invalid("Each virtual Shelly must have a unique name")
+        if len(set(hostnames)) != len(hostnames):
+            raise cv.Invalid("Each virtual Shelly must have a unique hostname")
+        for device in devices:
+            if len(device[CONF_CHANNELS]) not in (1, 2, 4):
+                raise cv.Invalid("Each device must have 1, 2, or 4 channels")
+            resolve_profile(device, bool(config.get(CONF_ON_SWITCH_STATE)))
     else:
-        if CONF_POWER_SENSOR not in config:
+        if CONF_CHANNELS in config:
+            if any(key in config for key in legacy_sensor_keys):
+                raise cv.Invalid("Use either channels or the legacy top-level sensor keys, not both")
+            if len(config[CONF_CHANNELS]) not in (1, 2, 4):
+                raise cv.Invalid("channels must contain 1, 2, or 4 entries to match a supported Shelly model")
+        elif CONF_POWER_SENSOR not in config:
             raise cv.Invalid("power_sensor is required when channels is not configured")
-    resolve_profile(config)
+        resolve_profile(config)
     return config
-
 
 FINAL_VALIDATE_SCHEMA = validate_config
 
@@ -121,40 +155,61 @@ FINAL_VALIDATE_SCHEMA = validate_config
 async def to_code(config):
     include_builtin_idf_component("esp_http_server")
     include_builtin_idf_component("esp_wifi")
+    include_builtin_idf_component("mdns")
     var = cg.new_Pvariable(config[CONF_ID])
     await cg.register_component(var, config)
-    cg.add(var.set_em_gen3(resolve_profile(config) == "em_gen3"))
     if config[CONF_ENABLE_BLE]:
         cg.add_build_flag("-DUSE_SHELLY_EMULATOR_BLE")
         ble_server = await cg.get_variable(config[CONF_BLE_SERVER_ID])
         cg.add(var.set_ble_server(ble_server))
         cg.add(var.set_ble_enabled(True))
-    cg.add(var.set_device_name(config[CONF_DEVICE_NAME]))
-    cg.add(var.set_wifi_ssid(config[CONF_WIFI_SSID]))
-    channels = config.get(CONF_CHANNELS)
-    if channels is None:
-        channels = [
+    devices = config.get(CONF_DEVICES)
+    if devices is None:
+        channels = config.get(CONF_CHANNELS)
+        if channels is None:
+            channels = [
+                {
+                    key: config[key]
+                    for key in (
+                        CONF_POWER_SENSOR,
+                        CONF_VOLTAGE_SENSOR,
+                        CONF_FREQUENCY_SENSOR,
+                        CONF_CURRENT_SENSOR,
+                        CONF_ENERGY_SENSOR,
+                    )
+                    if key in config
+                }
+            ]
+        devices = [
             {
-                key: config[key]
-                for key in (CONF_POWER_SENSOR, CONF_VOLTAGE_SENSOR, CONF_FREQUENCY_SENSOR, CONF_CURRENT_SENSOR, CONF_ENERGY_SENSOR)
-                if key in config
+                CONF_NAME: config[CONF_DEVICE_NAME],
+                CONF_HOSTNAME: "",
+                CONF_PROFILE: config[CONF_PROFILE],
+                CONF_WIFI_SSID: config[CONF_WIFI_SSID],
+                CONF_CHANNELS: channels,
             }
         ]
-    cg.add(var.set_channel_count(len(channels)))
-    for channel_id, channel in enumerate(channels):
-        for key, setter in (
-            (CONF_POWER_SENSOR, "set_channel_power_sensor"),
-            (CONF_VOLTAGE_SENSOR, "set_channel_voltage_sensor"),
-            (CONF_FREQUENCY_SENSOR, "set_channel_frequency_sensor"),
-            (CONF_CURRENT_SENSOR, "set_channel_current_sensor"),
-            (CONF_ENERGY_SENSOR, "set_channel_energy_sensor"),
-        ):
-            if key in channel:
-                sensor_var = await cg.get_variable(channel[key])
-                cg.add(getattr(var, setter)(channel_id, sensor_var))
-        if "output_switch" in channel:
-            output_switch = await cg.get_variable(channel["output_switch"])
-            cg.add(var.set_channel_output_switch(channel_id, output_switch))
+    cg.add(var.set_device_count(len(devices)))
+    for device_index, device in enumerate(devices):
+        cg.add(var.set_device_name(device_index, device[CONF_NAME]))
+        cg.add(var.set_device_hostname(device_index, device[CONF_HOSTNAME]))
+        cg.add(var.set_device_wifi_ssid(device_index, device[CONF_WIFI_SSID]))
+        cg.add(var.set_device_channel_count(device_index, len(device[CONF_CHANNELS])))
+        cg.add(var.set_device_em_gen3(device_index, resolve_profile(device, bool(config.get(CONF_ON_SWITCH_STATE))) == "em_gen3"))
+        for channel_index, channel in enumerate(device[CONF_CHANNELS]):
+            for key, setter in (
+                (CONF_POWER_SENSOR, "set_channel_power_sensor"),
+                (CONF_VOLTAGE_SENSOR, "set_channel_voltage_sensor"),
+                (CONF_FREQUENCY_SENSOR, "set_channel_frequency_sensor"),
+                (CONF_CURRENT_SENSOR, "set_channel_current_sensor"),
+                (CONF_ENERGY_SENSOR, "set_channel_energy_sensor"),
+            ):
+                if key in channel:
+                    sensor_var = await cg.get_variable(channel[key])
+                    cg.add(getattr(var, setter)(device_index, channel_index, sensor_var))
+            if "output_switch" in channel:
+                output_switch = await cg.get_variable(channel["output_switch"])
+                cg.add(var.set_channel_output_switch(device_index, channel_index, output_switch))
 
     for conf in config.get(CONF_ON_SWITCH_STATE, []):
         trigger = cg.new_Pvariable(conf[CONF_TRIGGER_ID])
