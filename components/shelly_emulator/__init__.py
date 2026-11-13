@@ -17,6 +17,7 @@ CONF_FREQUENCY_SENSOR = "frequency_sensor"
 CONF_CURRENT_SENSOR = "current_sensor"
 CONF_ENERGY_SENSOR = "energy_sensor"
 CONF_DEVICE_NAME = "device_name"
+CONF_PROFILE = "profile"
 CONF_WIFI_SSID = "wifi_ssid"
 CONF_TRIGGER_ID = "trigger_id"
 CONF_ON_SWITCH_STATE = "on_switch_state"
@@ -51,12 +52,38 @@ CONFIG_SCHEMA = cv.Schema(
         cv.Optional(CONF_CURRENT_SENSOR): cv.use_id(sensor.Sensor),
         cv.Optional(CONF_ENERGY_SENSOR): cv.use_id(sensor.Sensor),
         cv.Optional(CONF_DEVICE_NAME, default="ESPHome Metering Device"): cv.string,
+        cv.Optional(CONF_PROFILE, default="auto"): cv.one_of(
+            "auto", "plus1pm", "plus2pm", "pro4pm", "em_gen3", lower=True
+        ),
         cv.Optional(CONF_WIFI_SSID, default="Ethernet"): cv.string,
         cv.Optional(CONF_ON_SWITCH_STATE): automation.validate_automation(
             {cv.GenerateID(CONF_TRIGGER_ID): cv.declare_id(SwitchStateTrigger)}
         ),
     }
 ).extend(cv.COMPONENT_SCHEMA)
+
+
+def resolve_profile(config):
+    channels = config.get(CONF_CHANNELS)
+    if channels is None:
+        channels = [config]
+    channel_count = len(channels)
+    has_controls = bool(config.get(CONF_ON_SWITCH_STATE)) or any(
+        "output_switch" in channel for channel in channels
+    )
+
+    profile = config[CONF_PROFILE]
+    if profile == "auto":
+        if channel_count == 2 and not has_controls:
+            return "em_gen3"
+        profile = {1: "plus1pm", 2: "plus2pm", 4: "pro4pm"}[channel_count]
+
+    profile_channels = {"plus1pm": 1, "plus2pm": 2, "pro4pm": 4, "em_gen3": 2}
+    if channel_count != profile_channels[profile]:
+        raise cv.Invalid(f"profile {profile} requires {profile_channels[profile]} channel(s)")
+    if profile == "em_gen3" and has_controls:
+        raise cv.Invalid("profile em_gen3 does not support switch controls")
+    return profile
 
 
 def validate_config(config):
@@ -84,6 +111,7 @@ def validate_config(config):
     else:
         if CONF_POWER_SENSOR not in config:
             raise cv.Invalid("power_sensor is required when channels is not configured")
+    resolve_profile(config)
     return config
 
 
@@ -95,6 +123,7 @@ async def to_code(config):
     include_builtin_idf_component("esp_wifi")
     var = cg.new_Pvariable(config[CONF_ID])
     await cg.register_component(var, config)
+    cg.add(var.set_em_gen3(resolve_profile(config) == "em_gen3"))
     if config[CONF_ENABLE_BLE]:
         cg.add_build_flag("-DUSE_SHELLY_EMULATOR_BLE")
         ble_server = await cg.get_variable(config[CONF_BLE_SERVER_ID])

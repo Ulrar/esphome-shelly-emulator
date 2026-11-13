@@ -30,6 +30,7 @@ class ShellyEmulator : public Component {
   void set_ble_enabled(bool enabled) { this->ble_enabled_ = enabled; }
 #endif
   void set_channel_count(uint8_t count) { this->channel_count_ = count; }
+  void set_em_gen3(bool enabled) { this->em_gen3_ = enabled; }
   void add_switch_state_trigger(SwitchStateTrigger *trigger) {
     this->switch_state_triggers_.push_back(trigger);
   }
@@ -71,6 +72,9 @@ class ShellyEmulator : public Component {
   std::string device_info_();
   std::string switch_status_(int channel_id);
   std::string switch_config_(int channel_id);
+  std::string em1_status_(int channel_id) const;
+  std::string em1_data_status_(int channel_id) const;
+  std::string em1_config_(int channel_id) const;
   void update_wifi_scan_();
   std::string wifi_scan_();
   std::string wifi_status_();
@@ -107,6 +111,7 @@ class ShellyEmulator : public Component {
   std::array<std::atomic<int8_t>, 4> pending_switch_states_{};
   std::vector<SwitchStateTrigger *> switch_state_triggers_;
   uint8_t channel_count_{1};
+  bool em_gen3_{false};
   std::string device_name_{"ESPHome Metering Device"};
   std::string wifi_ssid_{"Ethernet"};
   bool wifi_scan_driver_ready_{false};
