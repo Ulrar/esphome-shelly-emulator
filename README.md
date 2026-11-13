@@ -1,8 +1,8 @@
 # Shelly multi-channel emulator for ESPHome
 
-This external component exposes ESPHome sensor readings as Shelly Gen 2 switch metering channels. It serves Shelly RPC over HTTP on port 80. The HTTP server accepts connections on the device's IP stack, so it works with ESPHome Wi-Fi or Ethernet configurations.
+This external component exposes ESPHome sensor readings through Shelly RPC over HTTP on port 80. It supports ESPHome Wi-Fi and Ethernet, and emulates Shelly Gen 2 switch metering or Shelly EM Gen 3 meter channels.
 
-Each channel requires a power sensor. Voltage, current, and cumulative energy sensors are optional. The number of entries selects the emulated Shelly profile automatically: one channel uses a Plus 1PM, two use a Plus 2PM, and four use a Pro 4PM. These profiles provide the supported channel counts of one, two, and four:
+Each channel requires a power sensor. Voltage, current, and cumulative energy sensors are optional. The default `profile: auto` selects Plus 1PM for one channel and Pro 4PM for four channels. With two channels, it selects EM Gen 3 when no switch controls are configured, or Plus 2PM when `output_switch` or `on_switch_state` is configured. EM Gen 3 exposes meter RPCs without switch controls. You can set `profile` to `plus1pm`, `plus2pm`, `pro4pm`, or `em_gen3` to choose a profile explicitly. The example below has two channels and no controls, so it selects EM Gen 3:
 
 ~~~yaml
 external_components:
@@ -34,7 +34,7 @@ Make sure each referenced sensor has an `id`. Power is in watts, voltage in volt
 
 ## Using the MyEnergi Ethernet decoder
 
-The [myenergi-ethernet component](https://github.com/Ulrar/esphome-myenergi-ethernet) exposes CT channel power and current as ESPHome sensors. The example below connects two Zappis to the emulator and integrates each charger's positive power into a persistent watt-hour total. Negative CT power is clamped to zero before integration, which avoids reducing the total when a channel reports negative power at idle.
+The [myenergi-ethernet component](https://github.com/Ulrar/esphome-myenergi-ethernet) exposes CT channel power and current as ESPHome sensors. The example below connects two Zappis to the emulator and integrates each charger's positive power into a persistent watt-hour total. Negative CT power is clamped to zero before integration, which avoids reducing the total when a channel reports negative power at idle. Its two channels have no switch controls, so the emulator selects the EM Gen 3 profile automatically.
 
 ~~~yaml
 myenergi_ethernet:

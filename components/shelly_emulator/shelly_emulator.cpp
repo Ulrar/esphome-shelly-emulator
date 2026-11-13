@@ -513,14 +513,25 @@ std::string ShellyEmulator::dispatch_rpc_(const std::string &method, int compone
   else if (rpc_method == "Shelly.GetConfig") {
     result = "{\"device\":{\"name\":\"" + escape_json(this->device_name_) +
              "\",\"id\":\"" + this->device_id_() + "\"},\"wifi\":" + this->wifi_config_();
-    for (uint8_t i = 0; i < this->channel_count_; i++)
-      result += ",\"switch:" + std::to_string(i) + "\":" + this->switch_config_(i);
+    for (uint8_t i = 0; i < this->channel_count_; i++) {
+      if (this->em_gen3_) {
+        result += ",\"em1:" + std::to_string(i) + "\":" + this->em1_config_(i);
+        result += ",\"em1data:" + std::to_string(i) + "\":{}";
+      } else {
+        result += ",\"switch:" + std::to_string(i) + "\":" + this->switch_config_(i);
+      }
+    }
     result += "}";
   } else if (rpc_method == "Shelly.ListMethods") {
     result = "{\"methods\":[\"Shelly.GetDeviceInfo\",\"Shelly.GetStatus\","
              "\"Shelly.GetConfig\",\"Shelly.ListMethods\",\"Sys.GetStatus\","
-             "\"WiFi.GetStatus\",\"WiFi.GetConfig\",\"WiFi.Scan\",\"WiFi.SetConfig\","
-             "\"Switch.GetStatus\",\"Switch.GetConfig\",\"Switch.Set\",\"Switch.Toggle\"]}";
+             "\"WiFi.GetStatus\",\"WiFi.GetConfig\",\"WiFi.Scan\",\"WiFi.SetConfig\"";
+    if (this->em_gen3_) {
+      result += ",\"EM1.GetStatus\",\"EM1.GetConfig\",\"EM1Data.GetStatus\",\"EM1Data.GetConfig\"";
+    } else {
+      result += ",\"Switch.GetStatus\",\"Switch.GetConfig\",\"Switch.Set\",\"Switch.Toggle\"";
+    }
+    result += "]}";
   } else if (rpc_method == "Sys.GetStatus") result = this->sys_status_();
   else if (rpc_method == "WiFi.GetStatus") result = this->wifi_status_();
   else if (rpc_method == "WiFi.Scan") result = this->wifi_scan_();
@@ -531,12 +542,27 @@ std::string ShellyEmulator::dispatch_rpc_(const std::string &method, int compone
     if (!ssid.empty()) this->wifi_ssid_ = ssid;
     ESP_LOGI(TAG, "WiFi.SetConfig received (SSID %s)", ssid.empty() ? "missing" : "provided");
     result = "{\"restart_required\":false}";
-  } else if (rpc_method == "Switch.GetStatus" && component_id >= 0 && component_id < this->channel_count_)
+  } else if (this->em_gen3_ && rpc_method == "EM1.GetStatus" &&
+             component_id >= 0 && component_id < this->channel_count_)
+    result = this->em1_status_(component_id);
+  else if (this->em_gen3_ && rpc_method == "EM1Data.GetStatus" &&
+           component_id >= 0 && component_id < this->channel_count_)
+    result = this->em1_data_status_(component_id);
+  else if (this->em_gen3_ && rpc_method == "EM1.GetConfig" &&
+           component_id >= 0 && component_id < this->channel_count_)
+    result = this->em1_config_(component_id);
+  else if (this->em_gen3_ && rpc_method == "EM1Data.GetConfig" &&
+           component_id >= 0 && component_id < this->channel_count_)
+    result = "{\"id\":" + std::to_string(component_id) + "}";
+  else if (!this->em_gen3_ && rpc_method == "Switch.GetStatus" &&
+           component_id >= 0 && component_id < this->channel_count_)
     result = this->switch_status_(component_id);
-  else if (rpc_method == "Switch.GetConfig" && component_id >= 0 && component_id < this->channel_count_)
+  else if (!this->em_gen3_ && rpc_method == "Switch.GetConfig" &&
+           component_id >= 0 && component_id < this->channel_count_)
     result = this->switch_config_(component_id);
-  else if ((rpc_method == "Switch.Set" || rpc_method == "Switch.Toggle") &&
-             component_id >= 0 && component_id < this->channel_count_) {
+  else if (!this->em_gen3_ &&
+           (rpc_method == "Switch.Set" || rpc_method == "Switch.Toggle") &&
+           component_id >= 0 && component_id < this->channel_count_) {
     const bool was_on = this->channels_[component_id].output != nullptr &&
                         this->channels_[component_id].output->state;
     bool requested_state = was_on;
@@ -621,28 +647,35 @@ std::string ShellyEmulator::device_id_() {
 }
 
 const char *ShellyEmulator::model_() const {
+  if (this->em_gen3_) return "S3EM-002CXCEU";
   if (this->channel_count_ == 2) return "SNSW-002P16EU";
   if (this->channel_count_ == 4) return "SPSW-004PE16EU";
   return "SNSW-001P16EU";
 }
 
 const char *ShellyEmulator::app_name_() const {
+  if (this->em_gen3_) return "EMG3";
   if (this->channel_count_ == 2) return "Plus2PM";
   if (this->channel_count_ == 4) return "Pro4PM";
   return "Plus1PM";
 }
 
 const char *ShellyEmulator::device_id_prefix_() const {
+  if (this->em_gen3_) return "shellyemg3-";
   if (this->channel_count_ == 2) return "shellyplus2pm-";
   if (this->channel_count_ == 4) return "shellypro4pm-";
   return "shellyplus1pm-";
 }
 
 std::string ShellyEmulator::device_info_() {
+  const char *firmware_id = this->em_gen3_
+      ? "20260311-095848/1.7.5-g9979d16"
+      : "20260311-095847/1.7.5-g9979d16";
   return "{\"name\":\"" + escape_json(this->device_name_) + "\",\"id\":\"" +
          this->device_id_() + "\",\"mac\":\"" + this->mac_address_() +
-         "\",\"model\":\"" + this->model_() + "\",\"gen\":2,\"fw_id\":\"20260311-095847/1.7.5-g9979d16\","
-         "\"ver\":\"1.7.5\",\"app\":\"" + this->app_name_() +
+         "\",\"model\":\"" + this->model_() + "\",\"gen\":" +
+         (this->em_gen3_ ? "3" : "2") + ",\"fw_id\":\"" + firmware_id +
+         "\",\"ver\":\"1.7.5\",\"app\":\"" + this->app_name_() +
          "\",\"auth_en\":false,\"discoverable\":"
 #ifdef USE_SHELLY_EMULATOR_BLE
          + std::string(this->ble_enabled_ ? "true" : "false") + "}";
@@ -684,6 +717,37 @@ std::string ShellyEmulator::switch_status_(int channel_id) {
 std::string ShellyEmulator::switch_config_(int channel_id) {
   return "{\"id\":" + std::to_string(channel_id) + ",\"name\":\"Metering Channel " +
          std::to_string(channel_id + 1) + "\",\"in_mode\":\"follow\",\"initial_state\":\"off\"}";
+}
+
+std::string ShellyEmulator::em1_status_(int channel_id) const {
+  const auto &channel = this->channels_[channel_id];
+  const float power = this->sensor_value_(channel.power);
+  const float voltage = this->sensor_value_(channel.voltage);
+  const float current = this->sensor_value_(channel.current);
+  const float apparent_power = std::fabs(voltage * current);
+  const float power_factor = apparent_power > 0.0f
+      ? std::clamp(power / apparent_power, -1.0f, 1.0f)
+      : 0.0f;
+  return "{\"id\":" + std::to_string(channel_id) +
+         ",\"voltage\":" + number(voltage) +
+         ",\"current\":" + number(current) +
+         ",\"act_power\":" + number(power) +
+         ",\"aprt_power\":" + number(apparent_power) +
+         ",\"pf\":" + number(power_factor) +
+         ",\"freq\":" + number(this->sensor_value_(channel.frequency)) +
+         ",\"errors\":[]}";
+}
+
+std::string ShellyEmulator::em1_data_status_(int channel_id) const {
+  return "{\"id\":" + std::to_string(channel_id) +
+         ",\"total_act_energy\":" +
+         number(this->sensor_value_(this->channels_[channel_id].energy)) +
+         ",\"total_act_ret_energy\":0.000}";
+}
+
+std::string ShellyEmulator::em1_config_(int channel_id) const {
+  return "{\"id\":" + std::to_string(channel_id) +
+         ",\"name\":null,\"reverse\":false,\"ct_type\":\"50A\"}";
 }
 
 std::string ShellyEmulator::wifi_status_() {
@@ -744,14 +808,21 @@ std::string ShellyEmulator::shelly_status_() {
          "},\"cloud\":{\"connected\":false},\"mqtt\":{\"connected\":false},"
          "\"sys\":" + this->sys_status_() + ",\"wifi\":" + this->wifi_status_() +
          this->network_status_();
-  for (uint8_t i = 0; i < this->channel_count_; i++)
-    status += ",\"switch:" + std::to_string(i) + "\":" + this->switch_status_(i);
+  for (uint8_t i = 0; i < this->channel_count_; i++) {
+    if (this->em_gen3_) {
+      status += ",\"em1:" + std::to_string(i) + "\":" + this->em1_status_(i);
+      status += ",\"em1data:" + std::to_string(i) + "\":" + this->em1_data_status_(i);
+    } else {
+      status += ",\"switch:" + std::to_string(i) + "\":" + this->switch_status_(i);
+    }
+  }
   status += "}";
   return status;
 }
 
 void ShellyEmulator::dump_config() {
-  ESP_LOGCONFIG(TAG, "Shelly %s emulator (%s, Gen 2)", this->app_name_(), this->model_());
+  ESP_LOGCONFIG(TAG, "Shelly %s emulator (%s, Gen %u)", this->app_name_(), this->model_(),
+                this->em_gen3_ ? 3U : 2U);
   ESP_LOGCONFIG(TAG, "  Channels: %u", this->channel_count_);
   ESP_LOGCONFIG(TAG, "  HTTP RPC port: 80");
   ESP_LOGCONFIG(TAG, "  BLE RPC: %s",
