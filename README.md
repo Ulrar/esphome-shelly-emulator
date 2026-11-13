@@ -1,6 +1,6 @@
 # Shelly multi-channel emulator for ESPHome
 
-This external component exposes ESPHome sensor readings through Shelly RPC over HTTP on port 80. It supports ESPHome Wi-Fi and Ethernet, and emulates Shelly Gen 2 switch metering or Shelly EM Gen 3 meter channels.
+This external component exposes ESPHome sensor readings through Shelly RPC over HTTP on port 80. It supports ESPHome Wi-Fi and Ethernet, and emulates one or several Shelly Gen 2 switch meters or Shelly EM Gen 3 meters.
 
 Each channel requires a power sensor. Voltage, current, and cumulative energy sensors are optional. The default `profile: auto` selects Plus 1PM for one channel and Pro 4PM for four channels. With two channels, it selects EM Gen 3 when no switch controls are configured, or Plus 2PM when `output_switch` or `on_switch_state` is configured. EM Gen 3 exposes meter RPCs without switch controls. You can set `profile` to `plus1pm`, `plus2pm`, `pro4pm`, or `em_gen3` to choose a profile explicitly. The example below has two channels and no controls, so it selects EM Gen 3:
 
@@ -31,6 +31,38 @@ shelly_emulator:
 ~~~
 
 Make sure each referenced sensor has an `id`. Power is in watts, voltage in volts, current in amps, and cumulative energy in watt-hours. The component reports zero for any omitted optional sensor. Existing single-channel configs using top-level `power_sensor`, `voltage_sensor`, `current_sensor`, and `energy_sensor` remain supported.
+
+## Emulating multiple Shelly devices
+
+The `devices` option creates two to four virtual Shelly devices on one ESP32. Multi-device mode requires BLE. It rotates the advertised BLE name every five seconds while idle and keeps the selected device fixed for the duration of each BLE connection. The same name is registered as an mDNS hostname, so the gateway's HTTP `Host` header selects the matching virtual device.
+
+`hostname` is the BLE name before ESPHome applies its configured name suffix. Keep it to 20 characters or fewer and make each value unique. ESPHome's effective advertised name is used for both mDNS and HTTP routing.
+
+```yaml
+esp32_ble:
+  name: ShellyEmulator
+
+esp32_ble_server:
+  id: shelly_ble_server
+
+shelly_emulator:
+  enable_ble: true
+  ble_server_id: shelly_ble_server
+  devices:
+    - name: Car chargers
+      hostname: ShellyPlus2PM-1097BD
+      profile: plus2pm
+      channels:
+        - power_sensor: zappi_one_power
+        - power_sensor: zappi_two_power
+    - name: Heat pump
+      hostname: ShellyPlus1PM-1097BE
+      profile: plus1pm
+      channels:
+        - power_sensor: heat_pump_power
+```
+
+Both virtual devices share the ESP32's physical BLE address. Only the advertised name and emulated Shelly data change; a gateway that identifies devices by BLE address may treat them as one device. Validate discovery and reconnection on the target gateway before relying on multiple devices.
 
 ## Using the MyEnergi Ethernet decoder
 
@@ -104,7 +136,7 @@ shelly_emulator:
 
 The integration input is in watts and uses hours as its integration unit, producing watt-hours for the Shelly energy fields. `restore: true` restores the totals after restarts; ESPHome writes preferences at the configured interval.
 
-Bluetooth RPC is optional. HTTP RPC continues to work without it. To enable BLE RPC, configure ESPHome's BLE components alongside the emulator:
+Bluetooth RPC is optional for a single virtual device. Multi-device mode requires BLE so the gateway can discover each virtual Shelly as its advertised name rotates. Configure ESPHome's BLE components alongside the emulator:
 
 ~~~yaml
 esp32_ble:
@@ -124,7 +156,7 @@ The ESP32 board must have network connectivity configured independently. The emu
 
 Each channel can map an ESPHome switch to Shelly's output state and switch commands. The `on_switch_state` automation can also handle those commands without configuring an output switch.
 
-The emulator can notify ESPHome automations when a Shelly switch changes state. The trigger arguments are `channel_id` (zero-based Shelly channel) and `is_on`. Repeated idempotent `Switch.Set` requests do not trigger another action.
+The emulator can notify ESPHome automations when a Shelly switch changes state. The trigger arguments are `channel_id` (zero-based channel for one device; for multiple devices, `device_index * 4 + channel_index`) and `is_on`. Repeated idempotent `Switch.Set` requests do not trigger another action.
 
 Use `on_switch_state` with ESPHome's Home Assistant Select platform to connect a Shelly channel to a cloud-backed Home Assistant mode select. Calling `select.set` on the imported ESPHome select invokes Home Assistant's `select.select_option` action.
 
