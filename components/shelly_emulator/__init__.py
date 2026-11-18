@@ -79,6 +79,11 @@ CONFIG_SCHEMA = cv.Schema(
         cv.Optional(CONF_CURRENT_SENSOR): cv.use_id(sensor.Sensor),
         cv.Optional(CONF_ENERGY_SENSOR): cv.use_id(sensor.Sensor),
         cv.Optional(CONF_DEVICE_NAME, default="ESPHome Metering Device"): cv.string,
+        cv.Optional(CONF_HOSTNAME): cv.All(
+            cv.string,
+            cv.Length(min=1, max=20),
+            validate_hostname,
+        ),
         cv.Optional(CONF_PROFILE, default="auto"): cv.one_of(
             "auto", "plus1pm", "plus2pm", "pro4pm", "em_gen3", lower=True
         ),
@@ -131,6 +136,8 @@ def validate_config(config):
         CONF_ENERGY_SENSOR,
     )
     if CONF_DEVICES in config:
+        if CONF_HOSTNAME in config:
+            raise cv.Invalid("hostname is only supported for a single virtual Shelly")
         if CONF_CHANNELS in config or any(key in config for key in legacy_sensor_keys):
             raise cv.Invalid("Use either devices or channels and top-level sensors, not both")
         if not config[CONF_ENABLE_BLE]:
@@ -191,7 +198,7 @@ async def to_code(config):
         devices = [
             {
                 CONF_NAME: config[CONF_DEVICE_NAME],
-                CONF_HOSTNAME: "",
+                CONF_HOSTNAME: config.get(CONF_HOSTNAME, ""),
                 CONF_PROFILE: config[CONF_PROFILE],
                 CONF_WIFI_SSID: config[CONF_WIFI_SSID],
                 CONF_CHANNELS: channels,

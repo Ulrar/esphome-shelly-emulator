@@ -150,6 +150,7 @@ void ShellyEmulator::setup() {
       this->mark_failed();
       return;
     }
+    if (!device.hostname.empty()) device.effective_hostname = device.hostname;
     for (uint8_t channel = 0; channel < device.channel_count; channel++) {
       if (device.channels[channel].power == nullptr) {
         ESP_LOGE(TAG, "Device %u channel %u has no power_sensor",
@@ -200,6 +201,13 @@ void ShellyEmulator::setup_ble_() {
     }
     this->set_ble_device_name_(0);
     this->ble_advertised_device_.store(0);
+  } else if (!this->devices_[0].hostname.empty()) {
+    if (esp32_ble::global_ble == nullptr) {
+      ESP_LOGE(TAG, "ESP32 BLE component is not initialized");
+      this->mark_failed();
+      return;
+    }
+    this->set_ble_device_name_(0);
   }
   this->ble_server_->set_advertising_required(true);
   using esp32_ble::ESPBTUUID;
