@@ -413,9 +413,10 @@ esp_err_t ShellyEmulator::handle_http_request_(httpd_req_t *request) {
   const std::string &rpc_request = request->method == HTTP_POST ? body : uri;
   const std::string response = this->dispatch_rpc_(device_index, method, component_id,
                                                     false, request_id, rpc_request);
+  const bool log_wifi_status = method == "WiFi.GetStatus" || method == "Wifi.GetStatus";
   httpd_resp_set_type(request, "application/json");
   const esp_err_t send_result = httpd_resp_send(request, response.c_str(), response.size());
-  if (log_switch_rpc) {
+  if (log_switch_rpc || log_wifi_status) {
     ESP_LOGI(TAG, "HTTP RPC response: %s", response.c_str());
     if (send_result == ESP_OK)
       ESP_LOGI(TAG, "HTTP RPC response sent successfully");
@@ -604,6 +605,8 @@ void ShellyEmulator::update_wifi_scan_() {
     if (results.size() > 20) results.resize(20);
 
     std::string json = "{\"results\":[";
+    std::vector<WifiAccessPoint> access_points;
+    access_points.reserve(results.size());
     bool first = true;
     for (const auto &entry : results) {
       const auto &record = entry.second;
@@ -613,6 +616,7 @@ void ShellyEmulator::update_wifi_scan_() {
       snprintf(bssid, sizeof(bssid), "%02X:%02X:%02X:%02X:%02X:%02X",
                record.bssid[0], record.bssid[1], record.bssid[2],
                record.bssid[3], record.bssid[4], record.bssid[5]);
+      access_points.push_back({entry.first, bssid, record.rssi});
       int auth = static_cast<int>(record.authmode);
       if (auth > 6) auth = 6;
       json += "{\"ssid\":\"" + escape_json(entry.first) + "\",\"bssid\":\"" + bssid +
@@ -624,6 +628,7 @@ void ShellyEmulator::update_wifi_scan_() {
 
     if (this->wifi_scan_mutex_ != nullptr) xSemaphoreTake(this->wifi_scan_mutex_, portMAX_DELAY);
     this->wifi_scan_results_ = std::move(json);
+    this->wifi_access_points_ = std::move(access_points);
     if (this->wifi_scan_mutex_ != nullptr) xSemaphoreGive(this->wifi_scan_mutex_);
     ESP_LOGI(TAG, "Wi-Fi scan complete: %u visible networks",
              static_cast<unsigned>(results.size()));
@@ -717,7 +722,9 @@ std::string ShellyEmulator::dispatch_rpc_(uint8_t device_index, const std::strin
   else if (rpc_method == "WiFi.GetConfig") result = this->wifi_config_(device_index);
   else if (rpc_method == "WiFi.SetConfig") {
     const std::string ssid = json_string_field(rpc_request, "ssid");
+    if (this->wifi_scan_mutex_ != nullptr) xSemaphoreTake(this->wifi_scan_mutex_, portMAX_DELAY);
     if (!ssid.empty()) device.wifi_ssid = ssid;
+    if (this->wifi_scan_mutex_ != nullptr) xSemaphoreGive(this->wifi_scan_mutex_);
     ESP_LOGI(TAG, "WiFi.SetConfig received for %s (SSID %s)",
              device.name.c_str(), ssid.empty() ? "missing" : "provided");
     result = "{\"restart_required\":false}";
@@ -935,31 +942,42 @@ std::string ShellyEmulator::wifi_status_(uint8_t device) {
   const std::string ip = this->local_ip_address_();
   const bool connected = ip != "0.0.0.0";
   const char *status = connected ? "got ip" : "disconnected";
-  ESP_LOGI(TAG, "WiFi.GetStatus response for %s: status=%s, sta_ip=%s, SSID %s",
-           this->devices_[device].name.c_str(), status, ip.c_str(),
-           this->devices_[device].wifi_ssid.empty() ? "not set" : "set");
-  uint8_t wifi_mac[6]{};
-  esp_read_mac(wifi_mac, ESP_MAC_WIFI_STA);
-  const unsigned bssid_octet_0 = (wifi_mac[0] & 0xFC) | 0x02;
-  const unsigned bssid_octet_5 = static_cast<uint8_t>(wifi_mac[5] ^ 0x01 ^ device);
-  char bssid[18];
-  snprintf(bssid, sizeof(bssid), "%02x:%02x:%02x:%02x:%02x:%02x", bssid_octet_0,
-           static_cast<unsigned>(wifi_mac[1]), static_cast<unsigned>(wifi_mac[2]),
-           static_cast<unsigned>(wifi_mac[3]), static_cast<unsigned>(wifi_mac[4]), bssid_octet_5);
+  std::string ssid;
+  std::string bssid;
+  int rssi = 0;
+  if (this->wifi_scan_mutex_ != nullptr) xSemaphoreTake(this->wifi_scan_mutex_, portMAX_DELAY);
+  ssid = this->devices_[device].wifi_ssid;
+  for (const auto &access_point : this->wifi_access_points_) {
+    if (access_point.ssid == ssid) {
+      bssid = access_point.bssid;
+      rssi = access_point.rssi;
+      break;
+    }
+  }
+  if (this->wifi_scan_mutex_ != nullptr) xSemaphoreGive(this->wifi_scan_mutex_);
 
+  ESP_LOGI(TAG, "WiFi.GetStatus response for %s: status=%s, sta_ip=%s, SSID %s, BSSID %s, RSSI %d",
+           this->devices_[device].name.c_str(), status, ip.c_str(),
+           ssid.empty() ? "not set" : "set", bssid.empty() ? "not found in scan" : bssid.c_str(),
+           rssi);
   return "{\"sta_ip\":\"" + ip + "\",\"status\":\"" + status +
-         "\",\"ssid\":\"" + escape_json(this->devices_[device].wifi_ssid) +
-         "\",\"bssid\":\"" + bssid + "\",\"rssi\":-55,\"sta_ip6\":[]}";
+         "\",\"ssid\":\"" + escape_json(ssid) +
+         "\",\"bssid\":\"" + bssid + "\",\"rssi\":" + std::to_string(rssi) +
+         ",\"sta_ip6\":[]}";
 }
 
 std::string ShellyEmulator::wifi_config_(uint8_t device) {
+  std::string ssid;
+  if (this->wifi_scan_mutex_ != nullptr) xSemaphoreTake(this->wifi_scan_mutex_, portMAX_DELAY);
+  ssid = this->devices_[device].wifi_ssid;
+  if (this->wifi_scan_mutex_ != nullptr) xSemaphoreGive(this->wifi_scan_mutex_);
   std::string ap_ssid = "Shelly" + std::string(this->app_name_(device)) + "-";
   for (char c : this->mac_address_(device))
     if (c != ':') ap_ssid.push_back(c);
 
   return "{\"ap\":{\"ssid\":\"" + ap_ssid +
          "\",\"is_open\":true,\"enable\":false,\"range_extender\":{\"enable\":false}},"
-         "\"sta\":{\"ssid\":\"" + escape_json(this->devices_[device].wifi_ssid) +
+         "\"sta\":{\"ssid\":\"" + escape_json(ssid) +
          "\",\"is_open\":false,\"enable\":true,\"ipv4mode\":\"dhcp\","
          "\"ip\":null,\"netmask\":null,\"gw\":null,\"nameserver\":null},"
          "\"sta1\":{\"ssid\":null,\"is_open\":true,\"enable\":false,"
