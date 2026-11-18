@@ -166,6 +166,7 @@ void ShellyEmulator::setup() {
   ESP_LOGI(TAG, "Waiting for a network address before starting HTTP RPC");
 }
 
+#ifdef USE_SHELLY_EMULATOR_BLE
 void ShellyEmulator::setup_ble_() {
   if (this->ble_server_ == nullptr) {
     ESP_LOGE(TAG, "ble_server_id must reference esp32_ble_server");
@@ -181,9 +182,8 @@ void ShellyEmulator::setup_ble_() {
     }
     for (size_t i = 0; i < this->devices_.size(); i++) {
       auto &device = this->devices_[i];
-      ble->set_name(device.hostname.c_str());
-      char name[esp32_ble::ESP32BLE::DEVICE_NAME_BUFFER_SIZE];
-      device.effective_hostname = ble->device_name(name);
+      device.effective_hostname = device.hostname;
+      ble->set_name(device.effective_hostname.c_str());
       auto normalized_name = [](std::string value) {
         for (char &character : value)
           character = static_cast<char>(tolower(static_cast<unsigned char>(character)));
