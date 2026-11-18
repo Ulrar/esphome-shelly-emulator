@@ -43,6 +43,7 @@ class ShellyEmulator : public Component {
     std::string effective_hostname;
     std::string wifi_ssid{"Ethernet"};
     bool hostname_registered{false};
+    uint32_t hostname_ip{0};
   };
 
  public:
@@ -152,6 +153,8 @@ class ShellyEmulator : public Component {
   SemaphoreHandle_t wifi_scan_mutex_{nullptr};
   std::string wifi_scan_results_{"{\"results\":[]}"};
   httpd_handle_t http_server_{nullptr};
+  uint32_t mdns_ip_{0};
+  int64_t mdns_retry_due_ms_{0};
 #ifdef USE_SHELLY_EMULATOR_BLE
   std::vector<uint8_t> ble_request_;
   std::vector<uint8_t> ble_response_;

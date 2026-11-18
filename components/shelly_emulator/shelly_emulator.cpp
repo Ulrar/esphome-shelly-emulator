@@ -412,7 +412,7 @@ esp_err_t ShellyEmulator::handle_http_request_(httpd_req_t *request) {
 
   const std::string &rpc_request = request->method == HTTP_POST ? body : uri;
   const std::string response = this->dispatch_rpc_(device_index, method, component_id,
-                                                    false, request_id, rpc_request);
+                                                    request->method == HTTP_POST, request_id, rpc_request);
   const bool log_wifi_status = method == "WiFi.GetStatus" || method == "Wifi.GetStatus";
   httpd_resp_set_type(request, "application/json");
   const esp_err_t send_result = httpd_resp_send(request, response.c_str(), response.size());
@@ -483,25 +483,47 @@ void ShellyEmulator::loop() {
     }
   }
 #endif
-  if (this->http_server_ == nullptr) {
-    esp_netif_ip_info_t info{};
-    if (!get_netif_ip(active_netif(), &info)) return;
+  esp_netif_ip_info_t info{};
+  const bool has_ip = get_netif_ip(active_netif(), &info);
+  const uint32_t current_ip = has_ip ? info.ip.addr : 0;
+  if (current_ip != this->mdns_ip_) {
+    this->mdns_ip_ = current_ip;
+    this->mdns_retry_due_ms_ = 0;
+  }
 
+  const int64_t now_ms = esp_timer_get_time() / 1000;
+  if (current_ip != 0 && now_ms >= this->mdns_retry_due_ms_) {
+    bool retry_registration = false;
     for (auto &device : this->devices_) {
-      if (device.effective_hostname.empty() || device.hostname_registered) continue;
+      if (device.effective_hostname.empty() ||
+          (device.hostname_registered && device.hostname_ip == current_ip))
+        continue;
+
       mdns_ip_addr_t address{};
       address.addr.type = ESP_IPADDR_TYPE_V4;
       address.addr.u_addr.ip4 = info.ip;
-      const esp_err_t err = mdns_delegate_hostname_add(device.effective_hostname.c_str(), &address);
+      const bool adding_hostname = !device.hostname_registered;
+      const esp_err_t err = adding_hostname
+          ? mdns_delegate_hostname_add(device.effective_hostname.c_str(), &address)
+          : mdns_delegate_hostname_set_address(device.effective_hostname.c_str(), &address);
       if (err == ESP_OK) {
         device.hostname_registered = true;
-        ESP_LOGI(TAG, "Registered virtual Shelly hostname: %s.local",
+        device.hostname_ip = current_ip;
+        ESP_LOGI(TAG, "%s virtual Shelly hostname: %s.local",
+                 adding_hostname ? "Registered" : "Updated",
                  device.effective_hostname.c_str());
       } else {
-        ESP_LOGW(TAG, "Could not register virtual Shelly hostname %s: %s",
+        retry_registration = true;
+        ESP_LOGW(TAG, "Could not %s virtual Shelly hostname %s: %s",
+                 adding_hostname ? "register" : "update",
                  device.effective_hostname.c_str(), esp_err_to_name(err));
       }
     }
+    if (retry_registration) this->mdns_retry_due_ms_ = now_ms + 5000;
+  }
+
+  if (this->http_server_ == nullptr) {
+    if (!has_ip) return;
 
     this->start_http_();
     if (!this->is_failed())
@@ -783,13 +805,11 @@ std::string ShellyEmulator::dispatch_rpc_(uint8_t device_index, const std::strin
       }
     }
     if (requested_state != was_on) {
-      if (output != nullptr) {
-        this->pending_switch_states_[flat_channel].store(requested_state ? 1 : 0,
-                                                         std::memory_order_release);
-      } else {
+      this->pending_switch_states_[flat_channel].store(requested_state ? 1 : 0,
+                                                       std::memory_order_release);
+      if (output == nullptr)
         this->emulated_output_states_[flat_channel].store(requested_state,
                                                           std::memory_order_release);
-      }
     }
     result = std::string("{\"was_on\":") + (was_on ? "true}" : "false}");
   } else {
