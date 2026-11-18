@@ -480,7 +480,10 @@ void ShellyEmulator::loop() {
 
     for (auto &device : this->devices_) {
       if (device.effective_hostname.empty() || device.hostname_registered) continue;
-      const esp_err_t err = mdns_hostname_add(device.effective_hostname.c_str());
+      mdns_ip_addr_t address{};
+      address.addr.type = ESP_IPADDR_TYPE_V4;
+      address.addr.u_addr.ip4 = info.ip;
+      const esp_err_t err = mdns_delegate_hostname_add(device.effective_hostname.c_str(), &address);
       if (err == ESP_OK) {
         device.hostname_registered = true;
         ESP_LOGI(TAG, "Registered virtual Shelly hostname: %s.local",
@@ -504,8 +507,7 @@ void ShellyEmulator::set_ble_device_name_(uint8_t device) {
   if (device >= this->devices_.size() || esp32_ble::global_ble == nullptr) return;
   esp32_ble::global_ble->set_name(this->devices_[device].hostname.c_str());
   if (this->ble_server_ != nullptr && this->ble_server_->is_running()) {
-    char name[esp32_ble::ESP32BLE::DEVICE_NAME_BUFFER_SIZE];
-    const esp_err_t err = esp_ble_gap_set_device_name(esp32_ble::global_ble->device_name(name));
+    const esp_err_t err = esp_ble_gap_set_device_name(this->devices_[device].hostname.c_str());
     if (err != ESP_OK) ESP_LOGW(TAG, "Could not update BLE device name: %s", esp_err_to_name(err));
   }
   ESP_LOGI(TAG, "BLE identity set to %s (%s)", this->devices_[device].name.c_str(),
