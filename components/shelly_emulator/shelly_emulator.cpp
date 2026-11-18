@@ -183,8 +183,9 @@ void ShellyEmulator::setup_ble_() {
     }
     for (size_t i = 0; i < this->devices_.size(); i++) {
       auto &device = this->devices_[i];
-      device.effective_hostname = device.hostname;
-      ble->set_name(device.effective_hostname.c_str());
+      ble->set_name(device.hostname.c_str());
+      char name_buffer[esp32_ble::ESP32BLE::DEVICE_NAME_BUFFER_SIZE]{};
+      device.effective_hostname = ble->device_name(name_buffer);
       auto normalized_name = [](std::string value) {
         for (char &character : value)
           character = static_cast<char>(tolower(static_cast<unsigned char>(character)));
@@ -536,13 +537,25 @@ void ShellyEmulator::loop() {
 #ifdef USE_SHELLY_EMULATOR_BLE
 void ShellyEmulator::set_ble_device_name_(uint8_t device) {
   if (device >= this->devices_.size() || esp32_ble::global_ble == nullptr) return;
-  esp32_ble::global_ble->set_name(this->devices_[device].hostname.c_str());
+  auto &virtual_device = this->devices_[device];
+  this->ble_expected_request_length_ = 0;
+  this->ble_request_.clear();
+  this->ble_response_.clear();
+  if (this->data_char_ != nullptr) this->data_char_->set_value(std::vector<uint8_t>{});
+  if (this->tx_control_char_ != nullptr) this->tx_control_char_->set_value(std::vector<uint8_t>{});
+  if (this->rx_control_char_ != nullptr)
+    this->rx_control_char_->set_value(std::vector<uint8_t>{0, 0, 0, 0});
+
+  auto *ble = esp32_ble::global_ble;
+  ble->set_name(virtual_device.hostname.c_str());
+  char name_buffer[esp32_ble::ESP32BLE::DEVICE_NAME_BUFFER_SIZE]{};
+  virtual_device.effective_hostname = ble->device_name(name_buffer);
   if (this->ble_server_ != nullptr && this->ble_server_->is_running()) {
-    const esp_err_t err = esp_ble_gap_set_device_name(this->devices_[device].hostname.c_str());
+    const esp_err_t err = esp_ble_gap_set_device_name(virtual_device.effective_hostname.c_str());
     if (err != ESP_OK) ESP_LOGW(TAG, "Could not update BLE device name: %s", esp_err_to_name(err));
   }
-  ESP_LOGI(TAG, "BLE identity set to %s (%s)", this->devices_[device].name.c_str(),
-           this->devices_[device].effective_hostname.c_str());
+  ESP_LOGI(TAG, "BLE identity set to %s (%s)", virtual_device.name.c_str(),
+           virtual_device.effective_hostname.c_str());
 }
 #endif
 
