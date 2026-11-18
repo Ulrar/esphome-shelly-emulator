@@ -1,5 +1,6 @@
 import esphome.codegen as cg
 import esphome.config_validation as cv
+import re
 from esphome import automation
 from esphome.components.esp32 import include_builtin_idf_component
 from esphome.components import esp32_ble_server, sensor, switch
@@ -25,6 +26,12 @@ CONF_DEVICES = "devices"
 CONF_NAME = "name"
 CONF_HOSTNAME = "hostname"
 
+
+def validate_hostname(value):
+    if re.fullmatch(r"^[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?$", value) is None:
+        raise cv.Invalid("hostname may contain only letters, digits, and hyphens")
+    return value
+
 shelly_ns = cg.esphome_ns.namespace("shelly_emulator")
 ShellyEmulator = shelly_ns.class_("ShellyEmulator", cg.Component)
 SwitchStateTrigger = shelly_ns.class_(
@@ -47,7 +54,7 @@ DEVICE_SCHEMA = cv.Schema(
         cv.Required(CONF_HOSTNAME): cv.All(
             cv.string,
             cv.Length(min=1, max=20),
-            cv.matches_regex(r"^[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?$"),
+            validate_hostname,
         ),
         cv.Optional(CONF_PROFILE, default="auto"): cv.one_of(
             "auto", "plus1pm", "plus2pm", "pro4pm", "em_gen3", lower=True
