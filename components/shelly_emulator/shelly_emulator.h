@@ -94,6 +94,7 @@ class ShellyEmulator : public Component {
       this->devices_[device].channels[channel].energy = sensor;
   }
 
+  float get_setup_priority() const override { return setup_priority::AFTER_BLUETOOTH; }
   void setup() override;
   void loop() override;
   void dump_config() override;
