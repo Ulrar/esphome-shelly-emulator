@@ -745,8 +745,11 @@ std::string ShellyEmulator::dispatch_rpc_(uint8_t device_index, const std::strin
   else if (!device.em_gen3 &&
            (rpc_method == "Switch.Set" || rpc_method == "Switch.Toggle") &&
            component_id >= 0 && component_id < device.channel_count) {
-    const bool was_on = device.channels[component_id].output != nullptr &&
-                        device.channels[component_id].output->state;
+    const size_t flat_channel = static_cast<size_t>(device_index) * 4 + component_id;
+    auto *output = device.channels[component_id].output;
+    const bool was_on = output != nullptr
+        ? output->state
+        : this->emulated_output_states_[flat_channel].load(std::memory_order_acquire);
     bool requested_state = was_on;
     if (rpc_method == "Switch.Toggle") {
       requested_state = !was_on;
@@ -780,9 +783,13 @@ std::string ShellyEmulator::dispatch_rpc_(uint8_t device_index, const std::strin
       }
     }
     if (requested_state != was_on) {
-      const size_t flat_channel = static_cast<size_t>(device_index) * 4 + component_id;
-      this->pending_switch_states_[flat_channel].store(requested_state ? 1 : 0,
-                                                       std::memory_order_release);
+      if (output != nullptr) {
+        this->pending_switch_states_[flat_channel].store(requested_state ? 1 : 0,
+                                                         std::memory_order_release);
+      } else {
+        this->emulated_output_states_[flat_channel].store(requested_state,
+                                                          std::memory_order_release);
+      }
     }
     result = std::string("{\"was_on\":") + (was_on ? "true}" : "false}");
   } else {
@@ -884,9 +891,13 @@ std::string ShellyEmulator::switch_status_(uint8_t device, int channel_id) {
   const float power_factor = apparent_power > 0.0f
       ? std::clamp(power / apparent_power, -1.0f, 1.0f)
       : 0.0f;
+  const size_t flat_channel = static_cast<size_t>(device) * 4 + channel_id;
+  const bool output = channel.output != nullptr
+      ? channel.output->state
+      : this->emulated_output_states_[flat_channel].load(std::memory_order_acquire);
   return "{\"id\":" + std::to_string(channel_id) +
          ",\"source\":\"HTTP\",\"output\":" +
-         std::string(channel.output != nullptr && channel.output->state ? "true" : "false") +
+         std::string(output ? "true" : "false") +
          ",\"apower\":" + number(power) +
          ",\"voltage\":" + number(voltage) +
          ",\"freq\":" + number(this->sensor_value_(channel.frequency)) +

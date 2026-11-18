@@ -143,6 +143,7 @@ class ShellyEmulator : public Component {
 #endif
   std::vector<VirtualDevice> devices_{1};
   std::array<std::atomic<int8_t>, 16> pending_switch_states_{};
+  std::array<std::atomic<bool>, 16> emulated_output_states_{};
   std::vector<SwitchStateTrigger *> switch_state_triggers_;
   bool wifi_scan_driver_ready_{false};
   bool wifi_scan_in_progress_{false};
