@@ -44,11 +44,6 @@ class ShellyEmulator : public Component {
     std::string wifi_ssid{"Ethernet"};
     bool hostname_registered{false};
   };
-  struct WifiAccessPoint {
-    std::string ssid;
-    std::string bssid;
-    int rssi{0};
-  };
 
  public:
 #ifdef USE_SHELLY_EMULATOR_BLE
@@ -155,7 +150,6 @@ class ShellyEmulator : public Component {
   std::atomic<bool> wifi_scan_requested_{false};
   SemaphoreHandle_t wifi_scan_mutex_{nullptr};
   std::string wifi_scan_results_{"{\"results\":[]}"};
-  std::vector<WifiAccessPoint> wifi_access_points_;
   httpd_handle_t http_server_{nullptr};
 #ifdef USE_SHELLY_EMULATOR_BLE
   std::vector<uint8_t> ble_request_;
