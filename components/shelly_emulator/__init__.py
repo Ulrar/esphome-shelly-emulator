@@ -8,6 +8,7 @@ from esphome.core import CORE
 from esphome.const import CONF_ID
 
 DEPENDENCIES = []
+AUTO_LOAD = ["switch"]
 
 CONF_BLE_SERVER_ID = "ble_server_id"
 CONF_ENABLE_BLE = "enable_ble"
