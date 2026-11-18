@@ -516,7 +516,7 @@ std::string ShellyEmulator::dispatch_rpc_(const std::string &method, int compone
     for (uint8_t i = 0; i < this->channel_count_; i++) {
       if (this->em_gen3_) {
         result += ",\"em1:" + std::to_string(i) + "\":" + this->em1_config_(i);
-        result += ",\"em1data:" + std::to_string(i) + "\":{}";
+        result += ",\"em1data:" + std::to_string(i) + "\":{\"id\":" + std::to_string(i) + "}";
       } else {
         result += ",\"switch:" + std::to_string(i) + "\":" + this->switch_config_(i);
       }
