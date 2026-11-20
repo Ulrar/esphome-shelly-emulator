@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cctype>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -10,6 +11,7 @@
 #include <vector>
 
 #include "esp_wifi.h"
+#include "mdns.h"
 
 #include "esp_mac.h"
 #include "esp_timer.h"
@@ -17,7 +19,9 @@
 #include "lwip/sockets.h"
 #include "esphome/core/log.h"
 #ifdef USE_SHELLY_EMULATOR_BLE
+#include "esphome/components/esp32_ble/ble.h"
 #include "esphome/components/esp32_ble/ble_uuid.h"
+#include <esp_gap_ble_api.h>
 #endif
 
 namespace esphome {
@@ -31,6 +35,12 @@ static constexpr char TX_CONTROL_CHAR_UUID[] = "5f6d4f53-5f52-5043-5f74-785f6374
 static constexpr char RX_CONTROL_CHAR_UUID[] = "5f6d4f53-5f52-5043-5f72-785f63746c5f";
 #endif
 static constexpr uint32_t MAX_RPC_FRAME = 4096;
+static constexpr int64_t BLE_ROTATION_INTERVAL_US = 5000000;
+static constexpr int64_t BLE_AD_RESTART_DELAY_US = 100000;
+static constexpr int64_t BLE_STOP_TIMEOUT_US = 2000000;
+static constexpr int8_t BLE_STOP_RESULT_PENDING = 0;
+static constexpr int8_t BLE_STOP_RESULT_SUCCESS = 1;
+static constexpr int8_t BLE_STOP_RESULT_FAILED = -1;
 
 static esp_err_t log_http_peer(httpd_handle_t, int sockfd) {
   sockaddr_in peer{};
@@ -119,6 +129,11 @@ static std::string number(float value) {
 }
 
 void ShellyEmulator::setup() {
+  if (this->devices_.empty() || this->devices_.size() > 4) {
+    ESP_LOGE(TAG, "The emulator requires between one and four virtual Shelly devices");
+    this->mark_failed();
+    return;
+  }
   for (auto &state : this->pending_switch_states_) state.store(-1);
   this->wifi_scan_mutex_ = xSemaphoreCreateMutex();
   if (this->wifi_scan_mutex_ == nullptr) {
@@ -126,16 +141,27 @@ void ShellyEmulator::setup() {
     this->mark_failed();
     return;
   }
-  if (this->channel_count_ != 1 && this->channel_count_ != 2 && this->channel_count_ != 4) {
-    ESP_LOGE(TAG, "The Shelly profile supports 1, 2, or 4 channels");
-    this->mark_failed();
-    return;
-  }
-  for (uint8_t i = 0; i < this->channel_count_; i++) {
-    if (this->channels_[i].power == nullptr) {
-      ESP_LOGE(TAG, "Channel %u has no power_sensor", i);
+  for (size_t device_index = 0; device_index < this->devices_.size(); device_index++) {
+    auto &device = this->devices_[device_index];
+    if (device.channel_count != 1 && device.channel_count != 2 && device.channel_count != 4) {
+      ESP_LOGE(TAG, "Device %u has an unsupported channel count", static_cast<unsigned>(device_index));
       this->mark_failed();
       return;
+    }
+    if (this->devices_.size() > 1 && device.hostname.empty()) {
+      ESP_LOGE(TAG, "Device %u requires a BLE hostname when multiple virtual devices are configured",
+               static_cast<unsigned>(device_index));
+      this->mark_failed();
+      return;
+    }
+    if (!device.hostname.empty()) device.effective_hostname = device.hostname;
+    for (uint8_t channel = 0; channel < device.channel_count; channel++) {
+      if (device.channels[channel].power == nullptr) {
+        ESP_LOGE(TAG, "Device %u channel %u has no power_sensor",
+                 static_cast<unsigned>(device_index), channel);
+        this->mark_failed();
+        return;
+      }
     }
   }
 #ifdef USE_SHELLY_EMULATOR_BLE
@@ -152,8 +178,47 @@ void ShellyEmulator::setup_ble_() {
     this->mark_failed();
     return;
   }
-  // This component adds its service at runtime, so the BLE server config has no
-  // static custom service from which to infer that advertising is required.
+  if (this->devices_.size() > 1) {
+    auto *ble = esp32_ble::global_ble;
+    if (ble == nullptr) {
+      ESP_LOGE(TAG, "ESP32 BLE component is not initialized");
+      this->mark_failed();
+      return;
+    }
+    for (size_t i = 0; i < this->devices_.size(); i++) {
+      auto &device = this->devices_[i];
+      ble->set_name(device.hostname.c_str());
+      char name_buffer[esp32_ble::ESP32BLE::DEVICE_NAME_BUFFER_SIZE]{};
+      device.effective_hostname = ble->device_name(name_buffer);
+      auto normalized_name = [](std::string value) {
+        for (char &character : value)
+          character = static_cast<char>(tolower(static_cast<unsigned char>(character)));
+        return value;
+      };
+      for (size_t previous = 0; previous < i; previous++) {
+        if (normalized_name(this->devices_[previous].effective_hostname) ==
+            normalized_name(device.effective_hostname)) {
+          ESP_LOGE(TAG, "Virtual Shelly BLE names must be unique after ESPHome applies its name settings");
+          this->mark_failed();
+          return;
+        }
+      }
+    }
+    this->set_ble_device_name_(0);
+    this->ble_advertised_device_.store(0);
+  } else if (!this->devices_[0].hostname.empty()) {
+    if (esp32_ble::global_ble == nullptr) {
+      ESP_LOGE(TAG, "ESP32 BLE component is not initialized");
+      this->mark_failed();
+      return;
+    }
+    auto *ble = esp32_ble::global_ble;
+    auto &device = this->devices_[0];
+    ble->set_name(device.hostname.c_str());
+    char name_buffer[esp32_ble::ESP32BLE::DEVICE_NAME_BUFFER_SIZE]{};
+    device.effective_hostname = ble->device_name(name_buffer);
+    this->set_ble_device_name_(0);
+  }
   this->ble_server_->set_advertising_required(true);
   using esp32_ble::ESPBTUUID;
   using esp32_ble_server::BLECharacteristic;
@@ -163,10 +228,20 @@ void ShellyEmulator::setup_ble_() {
     this->mark_failed();
     return;
   }
-  // setup() runs before BLEServer's asynchronous registration completes.
-  // Queue the runtime service so the server starts it once GATT is ready.
   if (!this->ble_server_->is_running())
     this->ble_server_->enqueue_start_service(this->ble_service_);
+  if (this->devices_.size() > 1) {
+    this->ble_server_->on_connect([this](uint16_t) {
+      if (this->ble_connected_clients_.fetch_add(1, std::memory_order_acq_rel) == 0) {
+        this->ble_active_device_.store(this->ble_advertised_device_.load(std::memory_order_acquire),
+                                       std::memory_order_release);
+      }
+    });
+    this->ble_server_->on_disconnect([this](uint16_t) {
+      const uint8_t previous = this->ble_connected_clients_.fetch_sub(1, std::memory_order_acq_rel);
+      if (previous == 1) this->ble_rotation_pending_.store(true, std::memory_order_release);
+    });
+  }
   this->data_char_ = this->ble_service_->create_characteristic(
       ESPBTUUID::from_raw(DATA_CHAR_UUID),
       BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_WRITE |
@@ -201,6 +276,16 @@ void ShellyEmulator::setup_ble_() {
   });
 }
 
+void ShellyEmulator::gap_event_handler(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param_t *param) {
+  if (event != ESP_GAP_BLE_ADV_STOP_COMPLETE_EVT || param == nullptr) return;
+  if (param->adv_stop_cmpl.status != ESP_BT_STATUS_SUCCESS) {
+    ESP_LOGW(TAG, "BLE advertising stop failed: %d", param->adv_stop_cmpl.status);
+    this->ble_stop_result_.store(BLE_STOP_RESULT_FAILED, std::memory_order_release);
+    return;
+  }
+  this->ble_stop_result_.store(BLE_STOP_RESULT_SUCCESS, std::memory_order_release);
+}
+
 void ShellyEmulator::handle_ble_write_(std::span<const uint8_t> data) {
   if (this->ble_expected_request_length_ == 0) return;
   const size_t remaining = this->ble_expected_request_length_ - this->ble_request_.size();
@@ -217,7 +302,9 @@ void ShellyEmulator::handle_ble_write_(std::span<const uint8_t> data) {
   if (params != std::string::npos)
     component_id = atoi(json_raw_field(request.substr(params), "id", "0").c_str());
 
-  const std::string response = this->dispatch_rpc_(method, component_id, true, request_id, request);
+  const uint8_t device = this->ble_active_device_.load(std::memory_order_acquire);
+  const std::string response =
+      this->dispatch_rpc_(device, method, component_id, true, request_id, request);
   if (method == "Wifi.GetStatus" || method == "WiFi.GetStatus") {
     ESP_LOGI(TAG, "BLE RPC response (%u bytes): %s",
              static_cast<unsigned>(response.size()), response.c_str());
@@ -326,12 +413,30 @@ esp_err_t ShellyEmulator::handle_http_request_(httpd_req_t *request) {
     return httpd_resp_sendstr(request, "{\"error\":\"unsupported request\"}");
   }
 
+  uint8_t device_index = 0;
+  if (this->devices_.size() > 1) {
+    char host[128]{};
+    if (httpd_req_get_hdr_value_str(request, "Host", host, sizeof(host)) != ESP_OK) {
+      ESP_LOGW(TAG, "Could not route request without an HTTP Host header");
+      httpd_resp_set_status(request, "421 Misdirected Request");
+      return httpd_resp_sendstr(request, "{\"error\":\"unknown Shelly hostname\"}");
+    }
+    const int found = this->device_for_host_(host);
+    if (found < 0) {
+      ESP_LOGW(TAG, "No virtual Shelly matches HTTP Host: %s", host);
+      httpd_resp_set_status(request, "421 Misdirected Request");
+      return httpd_resp_sendstr(request, "{\"error\":\"unknown Shelly hostname\"}");
+    }
+    device_index = static_cast<uint8_t>(found);
+  }
+
   const std::string &rpc_request = request->method == HTTP_POST ? body : uri;
-  const std::string response = this->dispatch_rpc_(method, component_id,
+  const std::string response = this->dispatch_rpc_(device_index, method, component_id,
                                                     request->method == HTTP_POST, request_id, rpc_request);
+  const bool log_wifi_status = method == "WiFi.GetStatus" || method == "Wifi.GetStatus";
   httpd_resp_set_type(request, "application/json");
   const esp_err_t send_result = httpd_resp_send(request, response.c_str(), response.size());
-  if (log_switch_rpc) {
+  if (log_switch_rpc || log_wifi_status) {
     ESP_LOGI(TAG, "HTTP RPC response: %s", response.c_str());
     if (send_result == ESP_OK)
       ESP_LOGI(TAG, "HTTP RPC response sent successfully");
@@ -343,32 +448,182 @@ esp_err_t ShellyEmulator::handle_http_request_(httpd_req_t *request) {
 
 void ShellyEmulator::loop() {
   if (this->is_failed()) return;
-  for (uint8_t channel = 0; channel < this->channel_count_; channel++) {
+  for (size_t flat_channel = 0; flat_channel < this->pending_switch_states_.size(); flat_channel++) {
     const int8_t requested_state =
-        this->pending_switch_states_[channel].exchange(-1, std::memory_order_acq_rel);
+        this->pending_switch_states_[flat_channel].exchange(-1, std::memory_order_acq_rel);
     if (requested_state < 0) continue;
-    if (auto *output = this->channels_[channel].output) {
+    const size_t device_index = flat_channel / 4;
+    const uint8_t channel_index = flat_channel % 4;
+    if (device_index >= this->devices_.size()) continue;
+    auto &device = this->devices_[device_index];
+    if (channel_index >= device.channel_count) continue;
+    if (auto *output = device.channels[channel_index].output) {
       if (requested_state != 0)
         output->turn_on();
       else
         output->turn_off();
     }
     for (auto *trigger : this->switch_state_triggers_)
-      trigger->trigger(channel, requested_state != 0);
+      trigger->trigger(static_cast<uint8_t>(flat_channel), requested_state != 0);
   }
-  if (this->http_server_ == nullptr) {
-    esp_netif_ip_info_t info{};
-    if (!get_netif_ip(active_netif(), &info)) return;
+#ifdef USE_SHELLY_EMULATOR_BLE
+  if (this->ble_enabled_ && this->devices_.size() > 1 && this->ble_server_ != nullptr &&
+      this->ble_server_->is_running() && esp32_ble::global_ble != nullptr) {
+    const int64_t now = esp_timer_get_time();
+    const uint8_t connected = this->ble_connected_clients_.load(std::memory_order_acquire);
+    if (this->ble_rotation_due_us_ == 0)
+      this->ble_rotation_due_us_ = now + BLE_ROTATION_INTERVAL_US;
+    if (connected == 0 && !this->ble_advertising_paused_ &&
+        now >= this->ble_rotation_due_us_)
+      this->ble_rotation_pending_.store(true, std::memory_order_release);
 
-    // httpd_start() creates lwIP sockets, which require the TCP/IP task and
-    // mutex to be initialized. Waiting for an assigned IP ensures the network
-    // stack is ready on both Wi-Fi and Ethernet.
+    if (connected == 0 &&
+        this->ble_rotation_pending_.exchange(false, std::memory_order_acq_rel)) {
+      this->ble_identity_change_pending_ = true;
+      if (!this->ble_advertising_paused_) {
+        this->ble_stop_result_.store(BLE_STOP_RESULT_PENDING, std::memory_order_relaxed);
+        this->ble_stop_requested_at_us_ = now;
+        this->ble_stop_complete_at_us_ = 0;
+        this->ble_advertising_paused_ = true;
+        esp32_ble::global_ble->advertising_stop();
+      }
+    }
+
+    if (connected > 0 && this->ble_identity_change_pending_)
+      this->ble_identity_change_pending_ = false;
+
+    const int8_t ble_stop_result =
+        this->ble_stop_result_.load(std::memory_order_acquire);
+    const bool ble_stop_timed_out =
+        this->ble_advertising_paused_ &&
+        ble_stop_result == BLE_STOP_RESULT_PENDING &&
+        this->ble_stop_requested_at_us_ != 0 &&
+        now >= this->ble_stop_requested_at_us_ + BLE_STOP_TIMEOUT_US;
+    if (this->ble_advertising_paused_ &&
+        (ble_stop_result == BLE_STOP_RESULT_FAILED || ble_stop_timed_out)) {
+      ESP_LOGW(TAG, "Restoring BLE advertising after stop %s",
+               ble_stop_timed_out ? "timeout" : "failure");
+      esp32_ble::global_ble->advertising_start();
+      this->ble_advertising_paused_ = false;
+      this->ble_identity_change_pending_ = false;
+      this->ble_stop_result_.store(BLE_STOP_RESULT_PENDING, std::memory_order_relaxed);
+      this->ble_stop_requested_at_us_ = 0;
+      this->ble_stop_complete_at_us_ = 0;
+      this->ble_restart_due_us_ = 0;
+      this->ble_rotation_due_us_ = now + BLE_ROTATION_INTERVAL_US;
+    }
+
+    const bool ble_stop_complete = ble_stop_result == BLE_STOP_RESULT_SUCCESS;
+    if (this->ble_advertising_paused_ && this->ble_identity_change_pending_ &&
+        ble_stop_complete && this->ble_stop_complete_at_us_ == 0) {
+      this->ble_stop_requested_at_us_ = 0;
+      this->ble_stop_complete_at_us_ = now;
+    }
+
+    if (this->ble_advertising_paused_ && this->ble_identity_change_pending_ &&
+        ble_stop_complete && this->ble_stop_complete_at_us_ != 0 &&
+        now >= this->ble_stop_complete_at_us_ + BLE_AD_RESTART_DELAY_US) {
+      if (this->ble_connected_clients_.load(std::memory_order_acquire) == 0) {
+        const uint8_t current = this->ble_advertised_device_.load(std::memory_order_acquire);
+        const uint8_t next = static_cast<uint8_t>((current + 1) % this->devices_.size());
+        this->set_ble_device_name_(next);
+        this->ble_advertised_device_.store(next, std::memory_order_release);
+        this->ble_identity_change_pending_ = false;
+        this->ble_restart_due_us_ = now + BLE_AD_RESTART_DELAY_US;
+      } else {
+        this->ble_identity_change_pending_ = false;
+      }
+    }
+
+    if (this->ble_advertising_paused_ && !this->ble_identity_change_pending_ &&
+        this->ble_restart_due_us_ != 0 && now >= this->ble_restart_due_us_) {
+      if (this->ble_connected_clients_.load(std::memory_order_acquire) == 0) {
+        esp32_ble::global_ble->advertising_start();
+        this->ble_advertising_paused_ = false;
+        this->ble_stop_result_.store(BLE_STOP_RESULT_PENDING, std::memory_order_relaxed);
+        this->ble_stop_requested_at_us_ = 0;
+        this->ble_stop_complete_at_us_ = 0;
+        this->ble_restart_due_us_ = 0;
+        this->ble_rotation_due_us_ = now + BLE_ROTATION_INTERVAL_US;
+      } else {
+        this->ble_restart_due_us_ = 0;
+      }
+    }
+  }
+#endif
+
+  esp_netif_ip_info_t info{};
+  const bool has_ip = get_netif_ip(active_netif(), &info);
+  const uint32_t current_ip = has_ip ? info.ip.addr : 0;
+  if (current_ip != this->mdns_ip_) {
+    this->mdns_ip_ = current_ip;
+    this->mdns_retry_due_ms_ = 0;
+  }
+
+  const int64_t now_ms = esp_timer_get_time() / 1000;
+  if (current_ip != 0 && now_ms >= this->mdns_retry_due_ms_) {
+    bool retry_registration = false;
+    for (auto &device : this->devices_) {
+      if (device.effective_hostname.empty() ||
+          (device.hostname_registered && device.hostname_ip == current_ip))
+        continue;
+
+      mdns_ip_addr_t address{};
+      address.addr.type = ESP_IPADDR_TYPE_V4;
+      address.addr.u_addr.ip4 = info.ip;
+      const bool adding_hostname = !device.hostname_registered;
+      const esp_err_t err = adding_hostname
+          ? mdns_delegate_hostname_add(device.effective_hostname.c_str(), &address)
+          : mdns_delegate_hostname_set_address(device.effective_hostname.c_str(), &address);
+      if (err == ESP_OK) {
+        device.hostname_registered = true;
+        device.hostname_ip = current_ip;
+        ESP_LOGI(TAG, "%s virtual Shelly hostname: %s.local",
+                 adding_hostname ? "Registered" : "Updated",
+                 device.effective_hostname.c_str());
+      } else {
+        retry_registration = true;
+        ESP_LOGW(TAG, "Could not %s virtual Shelly hostname %s: %s",
+                 adding_hostname ? "register" : "update",
+                 device.effective_hostname.c_str(), esp_err_to_name(err));
+      }
+    }
+    if (retry_registration) this->mdns_retry_due_ms_ = now_ms + 5000;
+  }
+
+  if (this->http_server_ == nullptr) {
+    if (!has_ip) return;
+
     this->start_http_();
     if (!this->is_failed())
-      ESP_LOGI(TAG, "Serving Shelly %s RPC on HTTP port 80 (Wi-Fi and Ethernet)", this->app_name_());
+      ESP_LOGI(TAG, "Serving %u virtual Shelly device(s) on HTTP port 80",
+               static_cast<unsigned>(this->devices_.size()));
   }
   this->update_wifi_scan_();
 }
+
+#ifdef USE_SHELLY_EMULATOR_BLE
+void ShellyEmulator::set_ble_device_name_(uint8_t device) {
+  if (device >= this->devices_.size() || esp32_ble::global_ble == nullptr) return;
+  auto &virtual_device = this->devices_[device];
+  this->ble_expected_request_length_ = 0;
+  this->ble_request_.clear();
+  this->ble_response_.clear();
+  if (this->data_char_ != nullptr) this->data_char_->set_value(std::vector<uint8_t>{});
+  if (this->tx_control_char_ != nullptr) this->tx_control_char_->set_value(std::vector<uint8_t>{});
+  if (this->rx_control_char_ != nullptr)
+    this->rx_control_char_->set_value(std::vector<uint8_t>{0, 0, 0, 0});
+
+  auto *ble = esp32_ble::global_ble;
+  ble->set_name(virtual_device.hostname.c_str());
+  if (this->ble_server_ != nullptr && this->ble_server_->is_running()) {
+    const esp_err_t err = esp_ble_gap_set_device_name(virtual_device.effective_hostname.c_str());
+    if (err != ESP_OK) ESP_LOGW(TAG, "Could not update BLE device name: %s", esp_err_to_name(err));
+  }
+  ESP_LOGI(TAG, "BLE identity set to %s (%s)", virtual_device.name.c_str(),
+           virtual_device.effective_hostname.c_str());
+}
+#endif
 
 void ShellyEmulator::update_wifi_scan_() {
   if (!this->wifi_scan_driver_ready_) {
@@ -501,20 +756,46 @@ std::string ShellyEmulator::wifi_scan_() {
   return result;
 }
 
-std::string ShellyEmulator::dispatch_rpc_(const std::string &method, int component_id,
-                                          bool ble, const std::string &request_id,
+int ShellyEmulator::device_for_host_(const std::string &host) const {
+  auto normalize = [](std::string value) {
+    const size_t port = value.find(':');
+    if (port != std::string::npos) value.resize(port);
+    while (!value.empty() && value.back() == '.') value.pop_back();
+    for (char &character : value)
+      character = static_cast<char>(tolower(static_cast<unsigned char>(character)));
+    constexpr char suffix[] = ".local";
+    if (value.size() >= sizeof(suffix) - 1 &&
+        value.compare(value.size() - (sizeof(suffix) - 1), sizeof(suffix) - 1, suffix) == 0)
+      value.resize(value.size() - (sizeof(suffix) - 1));
+    return value;
+  };
+  const std::string requested = normalize(host);
+  for (size_t i = 0; i < this->devices_.size(); i++)
+    if (normalize(this->devices_[i].effective_hostname) == requested) return static_cast<int>(i);
+  return -1;
+}
+
+std::string ShellyEmulator::dispatch_rpc_(uint8_t device_index, const std::string &method,
+                                          int component_id, bool ble, const std::string &request_id,
                                           const std::string &rpc_request) {
+  if (device_index >= this->devices_.size()) {
+    if (ble) return "{\"id\":" + request_id +
+        ",\"error\":{\"code\":-32601,\"message\":\"Method not found\"}}";
+    return "{\"error\":{\"code\":-32601,\"message\":\"Method not found\"}}";
+  }
+  auto &device = this->devices_[device_index];
   std::string result;
   const std::string rpc_method = method.rfind("Wifi.", 0) == 0
       ? "WiFi." + method.substr(5)
       : method;
-  if (rpc_method == "Shelly.GetDeviceInfo") result = this->device_info_();
-  else if (rpc_method == "Shelly.GetStatus") result = this->shelly_status_();
+  if (rpc_method == "Shelly.GetDeviceInfo") result = this->device_info_(device_index);
+  else if (rpc_method == "Shelly.GetStatus") result = this->shelly_status_(device_index);
   else if (rpc_method == "Shelly.GetConfig") {
-    result = "{\"device\":{\"name\":\"" + escape_json(this->device_name_) +
-             "\",\"id\":\"" + this->device_id_() + "\"},\"wifi\":" + this->wifi_config_();
-    for (uint8_t i = 0; i < this->channel_count_; i++) {
-      if (this->em_gen3_) {
+    result = "{\"device\":{\"name\":\"" + escape_json(device.name) +
+             "\",\"id\":\"" + this->device_id_(device_index) + "\"},\"wifi\":" +
+             this->wifi_config_(device_index);
+    for (uint8_t i = 0; i < device.channel_count; i++) {
+      if (device.em_gen3) {
         result += ",\"em1:" + std::to_string(i) + "\":" + this->em1_config_(i);
         result += ",\"em1data:" + std::to_string(i) + "\":{\"id\":" + std::to_string(i) + "}";
       } else {
@@ -526,45 +807,50 @@ std::string ShellyEmulator::dispatch_rpc_(const std::string &method, int compone
     result = "{\"methods\":[\"Shelly.GetDeviceInfo\",\"Shelly.GetStatus\","
              "\"Shelly.GetConfig\",\"Shelly.ListMethods\",\"Sys.GetStatus\","
              "\"WiFi.GetStatus\",\"WiFi.GetConfig\",\"WiFi.Scan\",\"WiFi.SetConfig\"";
-    if (this->em_gen3_) {
+    if (device.em_gen3) {
       result += ",\"EM1.GetStatus\",\"EM1.GetConfig\",\"EM1Data.GetStatus\",\"EM1Data.GetConfig\"";
     } else {
       result += ",\"Switch.GetStatus\",\"Switch.GetConfig\",\"Switch.Set\",\"Switch.Toggle\"";
     }
     result += "]}";
-  } else if (rpc_method == "Sys.GetStatus") result = this->sys_status_();
-  else if (rpc_method == "WiFi.GetStatus") result = this->wifi_status_();
+  } else if (rpc_method == "Sys.GetStatus") result = this->sys_status_(device_index);
+  else if (rpc_method == "WiFi.GetStatus") result = this->wifi_status_(device_index);
   else if (rpc_method == "WiFi.Scan") result = this->wifi_scan_();
-  else if (rpc_method == "WiFi.GetConfig") result = this->wifi_config_();
+  else if (rpc_method == "WiFi.GetConfig") result = this->wifi_config_(device_index);
   else if (rpc_method == "WiFi.SetConfig") {
-    // Accept Shelly BLE provisioning without switching the ESPHome network to Wi-Fi.
     const std::string ssid = json_string_field(rpc_request, "ssid");
-    if (!ssid.empty()) this->wifi_ssid_ = ssid;
-    ESP_LOGI(TAG, "WiFi.SetConfig received (SSID %s)", ssid.empty() ? "missing" : "provided");
+    if (this->wifi_scan_mutex_ != nullptr) xSemaphoreTake(this->wifi_scan_mutex_, portMAX_DELAY);
+    if (!ssid.empty()) device.wifi_ssid = ssid;
+    if (this->wifi_scan_mutex_ != nullptr) xSemaphoreGive(this->wifi_scan_mutex_);
+    ESP_LOGI(TAG, "WiFi.SetConfig received for %s (SSID %s)",
+             device.name.c_str(), ssid.empty() ? "missing" : "provided");
     result = "{\"restart_required\":false}";
-  } else if (this->em_gen3_ && rpc_method == "EM1.GetStatus" &&
-             component_id >= 0 && component_id < this->channel_count_)
-    result = this->em1_status_(component_id);
-  else if (this->em_gen3_ && rpc_method == "EM1Data.GetStatus" &&
-           component_id >= 0 && component_id < this->channel_count_)
-    result = this->em1_data_status_(component_id);
-  else if (this->em_gen3_ && rpc_method == "EM1.GetConfig" &&
-           component_id >= 0 && component_id < this->channel_count_)
+  } else if (device.em_gen3 && rpc_method == "EM1.GetStatus" &&
+             component_id >= 0 && component_id < device.channel_count)
+    result = this->em1_status_(device_index, component_id);
+  else if (device.em_gen3 && rpc_method == "EM1Data.GetStatus" &&
+           component_id >= 0 && component_id < device.channel_count)
+    result = this->em1_data_status_(device_index, component_id);
+  else if (device.em_gen3 && rpc_method == "EM1.GetConfig" &&
+           component_id >= 0 && component_id < device.channel_count)
     result = this->em1_config_(component_id);
-  else if (this->em_gen3_ && rpc_method == "EM1Data.GetConfig" &&
-           component_id >= 0 && component_id < this->channel_count_)
+  else if (device.em_gen3 && rpc_method == "EM1Data.GetConfig" &&
+           component_id >= 0 && component_id < device.channel_count)
     result = "{\"id\":" + std::to_string(component_id) + "}";
-  else if (!this->em_gen3_ && rpc_method == "Switch.GetStatus" &&
-           component_id >= 0 && component_id < this->channel_count_)
-    result = this->switch_status_(component_id);
-  else if (!this->em_gen3_ && rpc_method == "Switch.GetConfig" &&
-           component_id >= 0 && component_id < this->channel_count_)
+  else if (!device.em_gen3 && rpc_method == "Switch.GetStatus" &&
+           component_id >= 0 && component_id < device.channel_count)
+    result = this->switch_status_(device_index, component_id);
+  else if (!device.em_gen3 && rpc_method == "Switch.GetConfig" &&
+           component_id >= 0 && component_id < device.channel_count)
     result = this->switch_config_(component_id);
-  else if (!this->em_gen3_ &&
+  else if (!device.em_gen3 &&
            (rpc_method == "Switch.Set" || rpc_method == "Switch.Toggle") &&
-           component_id >= 0 && component_id < this->channel_count_) {
-    const bool was_on = this->channels_[component_id].output != nullptr &&
-                        this->channels_[component_id].output->state;
+           component_id >= 0 && component_id < device.channel_count) {
+    const size_t flat_channel = static_cast<size_t>(device_index) * 4 + component_id;
+    auto *output = device.channels[component_id].output;
+    const bool was_on = output != nullptr
+        ? output->state
+        : this->emulated_output_states_[flat_channel].load(std::memory_order_acquire);
     bool requested_state = was_on;
     if (rpc_method == "Switch.Toggle") {
       requested_state = !was_on;
@@ -597,12 +883,15 @@ std::string ShellyEmulator::dispatch_rpc_(const std::string &method, int compone
                    : "{\"error\":" + error + "}";
       }
     }
-    if (requested_state != was_on)
-      this->pending_switch_states_[component_id].store(requested_state ? 1 : 0,
-                                                        std::memory_order_release);
+    if (requested_state != was_on) {
+      this->pending_switch_states_[flat_channel].store(requested_state ? 1 : 0,
+                                                       std::memory_order_release);
+      if (output == nullptr)
+        this->emulated_output_states_[flat_channel].store(requested_state,
+                                                          std::memory_order_release);
+    }
     result = std::string("{\"was_on\":") + (was_on ? "true}" : "false}");
-  }
-  else {
+  } else {
     if (ble) return "{\"id\":" + request_id +
         ",\"error\":{\"code\":-32601,\"message\":\"Method not found\"}}";
     return "{\"error\":{\"code\":-32601,\"message\":\"Method not found\"}}";
@@ -614,11 +903,12 @@ std::string ShellyEmulator::rpc_result_(const std::string &id, const std::string
   return "{\"id\":" + id + ",\"result\":" + result + "}";
 }
 
-std::string ShellyEmulator::mac_address_() {
+std::string ShellyEmulator::mac_address_(uint8_t device_index) {
   uint8_t mac[6];
   esp_netif_t *netif = active_netif();
   if (netif == nullptr || esp_netif_get_mac(netif, mac) != ESP_OK)
     esp_read_mac(mac, ESP_MAC_WIFI_STA);
+  mac[5] = static_cast<uint8_t>(mac[5] + device_index);
   char text[18];
   snprintf(text, sizeof(text), "%02X:%02X:%02X:%02X:%02X:%02X", mac[0], mac[1], mac[2], mac[3],
            mac[4], mac[5]);
@@ -639,43 +929,46 @@ std::string ShellyEmulator::network_status_() {
   return ",\"eth\":{\"ip\":\"" + ip_to_string(info.ip) + "\"}";
 }
 
-std::string ShellyEmulator::device_id_() {
-  std::string id = this->device_id_prefix_();
-  for (char c : this->mac_address_())
+std::string ShellyEmulator::device_id_(uint8_t device) {
+  std::string id = this->device_id_prefix_(device);
+  for (char c : this->mac_address_(device))
     if (c != ':') id.push_back(static_cast<char>(tolower(c)));
   return id;
 }
 
-const char *ShellyEmulator::model_() const {
-  if (this->em_gen3_) return "S3EM-002CXCEU";
-  if (this->channel_count_ == 2) return "SNSW-002P16EU";
-  if (this->channel_count_ == 4) return "SPSW-004PE16EU";
+const char *ShellyEmulator::model_(uint8_t device) const {
+  const auto &virtual_device = this->devices_[device];
+  if (virtual_device.em_gen3) return "S3EM-002CXCEU";
+  if (virtual_device.channel_count == 2) return "SNSW-002P16EU";
+  if (virtual_device.channel_count == 4) return "SPSW-004PE16EU";
   return "SNSW-001P16EU";
 }
 
-const char *ShellyEmulator::app_name_() const {
-  if (this->em_gen3_) return "EMG3";
-  if (this->channel_count_ == 2) return "Plus2PM";
-  if (this->channel_count_ == 4) return "Pro4PM";
+const char *ShellyEmulator::app_name_(uint8_t device) const {
+  const auto &virtual_device = this->devices_[device];
+  if (virtual_device.em_gen3) return "EMG3";
+  if (virtual_device.channel_count == 2) return "Plus2PM";
+  if (virtual_device.channel_count == 4) return "Pro4PM";
   return "Plus1PM";
 }
 
-const char *ShellyEmulator::device_id_prefix_() const {
-  if (this->em_gen3_) return "shellyemg3-";
-  if (this->channel_count_ == 2) return "shellyplus2pm-";
-  if (this->channel_count_ == 4) return "shellypro4pm-";
+const char *ShellyEmulator::device_id_prefix_(uint8_t device) const {
+  const auto &virtual_device = this->devices_[device];
+  if (virtual_device.em_gen3) return "shellyemg3-";
+  if (virtual_device.channel_count == 2) return "shellyplus2pm-";
+  if (virtual_device.channel_count == 4) return "shellypro4pm-";
   return "shellyplus1pm-";
 }
 
-std::string ShellyEmulator::device_info_() {
-  const char *firmware_id = this->em_gen3_
+std::string ShellyEmulator::device_info_(uint8_t device) {
+  const char *firmware_id = this->devices_[device].em_gen3
       ? "20260311-095848/1.7.5-g9979d16"
       : "20260311-095847/1.7.5-g9979d16";
-  return "{\"name\":\"" + escape_json(this->device_name_) + "\",\"id\":\"" +
-         this->device_id_() + "\",\"mac\":\"" + this->mac_address_() +
-         "\",\"model\":\"" + this->model_() + "\",\"gen\":" +
-         (this->em_gen3_ ? "3" : "2") + ",\"fw_id\":\"" + firmware_id +
-         "\",\"ver\":\"1.7.5\",\"app\":\"" + this->app_name_() +
+  return "{\"name\":\"" + escape_json(this->devices_[device].name) + "\",\"id\":\"" +
+         this->device_id_(device) + "\",\"mac\":\"" + this->mac_address_(device) +
+         "\",\"model\":\"" + this->model_(device) + "\",\"gen\":" +
+         (this->devices_[device].em_gen3 ? "3" : "2") + ",\"fw_id\":\"" + firmware_id +
+         "\",\"ver\":\"1.7.5\",\"app\":\"" + this->app_name_(device) +
          "\",\"auth_en\":false,\"discoverable\":"
 #ifdef USE_SHELLY_EMULATOR_BLE
          + std::string(this->ble_enabled_ ? "true" : "false") + "}";
@@ -688,8 +981,8 @@ float ShellyEmulator::sensor_value_(sensor::Sensor *sensor) const {
   return sensor != nullptr && std::isfinite(sensor->state) ? sensor->state : 0.0f;
 }
 
-std::string ShellyEmulator::switch_status_(int channel_id) {
-  const auto &channel = this->channels_[channel_id];
+std::string ShellyEmulator::switch_status_(uint8_t device, int channel_id) {
+  const auto &channel = this->devices_[device].channels[channel_id];
   const float power = this->sensor_value_(channel.power);
   const float voltage = this->sensor_value_(channel.voltage);
   const float current = this->sensor_value_(channel.current);
@@ -697,12 +990,13 @@ std::string ShellyEmulator::switch_status_(int channel_id) {
   const float power_factor = apparent_power > 0.0f
       ? std::clamp(power / apparent_power, -1.0f, 1.0f)
       : 0.0f;
+  const size_t flat_channel = static_cast<size_t>(device) * 4 + channel_id;
+  const bool output = channel.output != nullptr
+      ? channel.output->state
+      : this->emulated_output_states_[flat_channel].load(std::memory_order_acquire);
   return "{\"id\":" + std::to_string(channel_id) +
          ",\"source\":\"HTTP\",\"output\":" +
-         std::string(this->channels_[channel_id].output != nullptr &&
-                             this->channels_[channel_id].output->state
-                         ? "true"
-                         : "false") +
+         std::string(output ? "true" : "false") +
          ",\"apower\":" + number(power) +
          ",\"voltage\":" + number(voltage) +
          ",\"freq\":" + number(this->sensor_value_(channel.frequency)) +
@@ -719,8 +1013,8 @@ std::string ShellyEmulator::switch_config_(int channel_id) {
          std::to_string(channel_id + 1) + "\",\"in_mode\":\"follow\",\"initial_state\":\"off\"}";
 }
 
-std::string ShellyEmulator::em1_status_(int channel_id) const {
-  const auto &channel = this->channels_[channel_id];
+std::string ShellyEmulator::em1_status_(uint8_t device, int channel_id) const {
+  const auto &channel = this->devices_[device].channels[channel_id];
   const float power = this->sensor_value_(channel.power);
   const float voltage = this->sensor_value_(channel.voltage);
   const float current = this->sensor_value_(channel.current);
@@ -738,10 +1032,10 @@ std::string ShellyEmulator::em1_status_(int channel_id) const {
          ",\"errors\":[]}";
 }
 
-std::string ShellyEmulator::em1_data_status_(int channel_id) const {
+std::string ShellyEmulator::em1_data_status_(uint8_t device, int channel_id) const {
   return "{\"id\":" + std::to_string(channel_id) +
          ",\"total_act_energy\":" +
-         number(this->sensor_value_(this->channels_[channel_id].energy)) +
+         number(this->sensor_value_(this->devices_[device].channels[channel_id].energy)) +
          ",\"total_act_ret_energy\":0.000}";
 }
 
@@ -750,38 +1044,44 @@ std::string ShellyEmulator::em1_config_(int channel_id) const {
          ",\"name\":null,\"reverse\":false,\"ct_type\":\"50A\"}";
 }
 
-std::string ShellyEmulator::wifi_status_() {
+std::string ShellyEmulator::wifi_status_(uint8_t device) {
   const std::string ip = this->local_ip_address_();
   const bool connected = ip != "0.0.0.0";
   const char *status = connected ? "got ip" : "disconnected";
-  ESP_LOGI(TAG, "WiFi.GetStatus response: status=%s, sta_ip=%s, SSID %s",
-           status, ip.c_str(), this->wifi_ssid_.empty() ? "not set" : "set");
+  std::string ssid;
+  if (this->wifi_scan_mutex_ != nullptr) xSemaphoreTake(this->wifi_scan_mutex_, portMAX_DELAY);
+  ssid = this->devices_[device].wifi_ssid;
+  if (this->wifi_scan_mutex_ != nullptr) xSemaphoreGive(this->wifi_scan_mutex_);
+
+  ESP_LOGI(TAG, "WiFi.GetStatus response for %s: status=%s, sta_ip=%s, SSID %s",
+           this->devices_[device].name.c_str(), status, ip.c_str(),
+           ssid.empty() ? "not set" : "set");
   uint8_t wifi_mac[6]{};
   esp_read_mac(wifi_mac, ESP_MAC_WIFI_STA);
-
-  // Expose stable, plausible station details to BLE provisioning clients while
-  // the device itself remains connected over Ethernet.
   const unsigned bssid_octet_0 = (wifi_mac[0] & 0xFC) | 0x02;
-  const unsigned bssid_octet_5 = wifi_mac[5] ^ 0x01;
+  const unsigned bssid_octet_5 = static_cast<uint8_t>(wifi_mac[5] ^ 0x01 ^ device);
   char bssid[18];
   snprintf(bssid, sizeof(bssid), "%02x:%02x:%02x:%02x:%02x:%02x", bssid_octet_0,
            static_cast<unsigned>(wifi_mac[1]), static_cast<unsigned>(wifi_mac[2]),
            static_cast<unsigned>(wifi_mac[3]), static_cast<unsigned>(wifi_mac[4]), bssid_octet_5);
 
-  // This Ethernet-only device has no Wi-Fi station IPv6 address to report.
   return "{\"sta_ip\":\"" + ip + "\",\"status\":\"" + status +
-         "\",\"ssid\":\"" + escape_json(this->wifi_ssid_) + "\",\"bssid\":\"" + bssid +
+         "\",\"ssid\":\"" + escape_json(ssid) + "\",\"bssid\":\"" + bssid +
          "\",\"rssi\":-55,\"sta_ip6\":[]}";
 }
 
-std::string ShellyEmulator::wifi_config_() {
-  std::string ap_ssid = "Shelly" + std::string(this->app_name_()) + "-";
-  for (char c : this->mac_address_())
+std::string ShellyEmulator::wifi_config_(uint8_t device) {
+  std::string ssid;
+  if (this->wifi_scan_mutex_ != nullptr) xSemaphoreTake(this->wifi_scan_mutex_, portMAX_DELAY);
+  ssid = this->devices_[device].wifi_ssid;
+  if (this->wifi_scan_mutex_ != nullptr) xSemaphoreGive(this->wifi_scan_mutex_);
+  std::string ap_ssid = "Shelly" + std::string(this->app_name_(device)) + "-";
+  for (char c : this->mac_address_(device))
     if (c != ':') ap_ssid.push_back(c);
 
   return "{\"ap\":{\"ssid\":\"" + ap_ssid +
          "\",\"is_open\":true,\"enable\":false,\"range_extender\":{\"enable\":false}},"
-         "\"sta\":{\"ssid\":\"" + escape_json(this->wifi_ssid_) +
+         "\"sta\":{\"ssid\":\"" + escape_json(ssid) +
          "\",\"is_open\":false,\"enable\":true,\"ipv4mode\":\"dhcp\","
          "\"ip\":null,\"netmask\":null,\"gw\":null,\"nameserver\":null},"
          "\"sta1\":{\"ssid\":null,\"is_open\":true,\"enable\":false,"
@@ -790,30 +1090,32 @@ std::string ShellyEmulator::wifi_config_() {
          "\"roam\":{\"rssi_thr\":-80,\"interval\":60}}";
 }
 
-std::string ShellyEmulator::sys_status_() {
+std::string ShellyEmulator::sys_status_(uint8_t device) {
   const uint64_t uptime = static_cast<uint64_t>(esp_timer_get_time() / 1000000ULL);
   char uptime_text[24];
   snprintf(uptime_text, sizeof(uptime_text), "%llu", static_cast<unsigned long long>(uptime));
-  return "{\"mac\":\"" + this->mac_address_() +
+  return "{\"mac\":\"" + this->mac_address_(device) +
          "\",\"restart_required\":false,\"uptime\":" + uptime_text +
          ",\"ram_size\":0,\"ram_free\":0}";
 }
 
-std::string ShellyEmulator::shelly_status_() {
+std::string ShellyEmulator::shelly_status_(uint8_t device_index) {
+  const auto &device = this->devices_[device_index];
   bool ble_enabled = false;
 #ifdef USE_SHELLY_EMULATOR_BLE
   ble_enabled = this->ble_enabled_;
 #endif
   std::string status = "{\"ble\":{\"enable\":" + std::string(ble_enabled ? "true" : "false") +
          "},\"cloud\":{\"connected\":false},\"mqtt\":{\"connected\":false},"
-         "\"sys\":" + this->sys_status_() + ",\"wifi\":" + this->wifi_status_() +
+         "\"sys\":" + this->sys_status_(device_index) +
+         ",\"wifi\":" + this->wifi_status_(device_index) +
          this->network_status_();
-  for (uint8_t i = 0; i < this->channel_count_; i++) {
-    if (this->em_gen3_) {
-      status += ",\"em1:" + std::to_string(i) + "\":" + this->em1_status_(i);
-      status += ",\"em1data:" + std::to_string(i) + "\":" + this->em1_data_status_(i);
+  for (uint8_t i = 0; i < device.channel_count; i++) {
+    if (device.em_gen3) {
+      status += ",\"em1:" + std::to_string(i) + "\":" + this->em1_status_(device_index, i);
+      status += ",\"em1data:" + std::to_string(i) + "\":" + this->em1_data_status_(device_index, i);
     } else {
-      status += ",\"switch:" + std::to_string(i) + "\":" + this->switch_status_(i);
+      status += ",\"switch:" + std::to_string(i) + "\":" + this->switch_status_(device_index, i);
     }
   }
   status += "}";
@@ -821,9 +1123,14 @@ std::string ShellyEmulator::shelly_status_() {
 }
 
 void ShellyEmulator::dump_config() {
-  ESP_LOGCONFIG(TAG, "Shelly %s emulator (%s, Gen %u)", this->app_name_(), this->model_(),
-                this->em_gen3_ ? 3U : 2U);
-  ESP_LOGCONFIG(TAG, "  Channels: %u", this->channel_count_);
+  ESP_LOGCONFIG(TAG, "Shelly emulator devices: %u", static_cast<unsigned>(this->devices_.size()));
+  for (size_t i = 0; i < this->devices_.size(); i++) {
+    ESP_LOGCONFIG(TAG, "  %s (%s, Gen %u, %u channels)", this->devices_[i].name.c_str(),
+                  this->model_(i), this->devices_[i].em_gen3 ? 3U : 2U,
+                  this->devices_[i].channel_count);
+    if (!this->devices_[i].hostname.empty())
+      ESP_LOGCONFIG(TAG, "    Hostname: %s.local", this->devices_[i].effective_hostname.c_str());
+  }
   ESP_LOGCONFIG(TAG, "  HTTP RPC port: 80");
   ESP_LOGCONFIG(TAG, "  BLE RPC: %s",
 #ifdef USE_SHELLY_EMULATOR_BLE
