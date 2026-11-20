@@ -273,15 +273,12 @@ void ShellyEmulator::setup_ble_() {
 }
 
 void ShellyEmulator::gap_event_handler(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param_t *param) {
-  if (event != ESP_GAP_BLE_ADV_STOP_COMPLETE_EVT || param == nullptr ||
-      !this->ble_advertising_paused_)
-    return;
+  if (event != ESP_GAP_BLE_ADV_STOP_COMPLETE_EVT || param == nullptr) return;
   if (param->adv_stop_cmpl.status != ESP_BT_STATUS_SUCCESS) {
     ESP_LOGW(TAG, "BLE advertising stop failed: %d", param->adv_stop_cmpl.status);
     return;
   }
-  this->ble_stop_complete_ = true;
-  this->ble_stop_complete_at_us_ = esp_timer_get_time();
+  this->ble_stop_complete_.store(true, std::memory_order_release);
 }
 
 void ShellyEmulator::handle_ble_write_(std::span<const uint8_t> data) {
@@ -477,20 +474,26 @@ void ShellyEmulator::loop() {
 
     if (connected == 0 &&
         this->ble_rotation_pending_.exchange(false, std::memory_order_acq_rel)) {
-      if (!this->ble_advertising_paused_) {
-        esp32_ble::global_ble->advertising_stop();
-        this->ble_advertising_paused_ = true;
-        this->ble_stop_complete_ = false;
-        this->ble_stop_complete_at_us_ = 0;
-      }
       this->ble_identity_change_pending_ = true;
+      if (!this->ble_advertising_paused_) {
+        this->ble_stop_complete_.store(false, std::memory_order_relaxed);
+        this->ble_stop_complete_at_us_ = 0;
+        this->ble_advertising_paused_ = true;
+        esp32_ble::global_ble->advertising_stop();
+      }
     }
 
     if (connected > 0 && this->ble_identity_change_pending_)
       this->ble_identity_change_pending_ = false;
 
+    const bool ble_stop_complete =
+        this->ble_stop_complete_.load(std::memory_order_acquire);
     if (this->ble_advertising_paused_ && this->ble_identity_change_pending_ &&
-        this->ble_stop_complete_ && this->ble_stop_complete_at_us_ != 0 &&
+        ble_stop_complete && this->ble_stop_complete_at_us_ == 0)
+      this->ble_stop_complete_at_us_ = now;
+
+    if (this->ble_advertising_paused_ && this->ble_identity_change_pending_ &&
+        ble_stop_complete && this->ble_stop_complete_at_us_ != 0 &&
         now >= this->ble_stop_complete_at_us_ + BLE_AD_RESTART_DELAY_US) {
       if (this->ble_connected_clients_.load(std::memory_order_acquire) == 0) {
         const uint8_t current = this->ble_advertised_device_.load(std::memory_order_acquire);
@@ -509,7 +512,7 @@ void ShellyEmulator::loop() {
       if (this->ble_connected_clients_.load(std::memory_order_acquire) == 0) {
         esp32_ble::global_ble->advertising_start();
         this->ble_advertising_paused_ = false;
-        this->ble_stop_complete_ = false;
+        this->ble_stop_complete_.store(false, std::memory_order_relaxed);
         this->ble_stop_complete_at_us_ = 0;
         this->ble_restart_due_us_ = 0;
         this->ble_rotation_due_us_ = now + BLE_ROTATION_INTERVAL_US;
