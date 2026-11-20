@@ -191,5 +191,5 @@ shelly_emulator:
       output_switch: charger_one_fast_mode
 ~~~
 
-The emulator reads the referenced switch state for `Switch.GetStatus.output` and routes `Switch.Set` and `Switch.Toggle` to that switch. If `output_switch` is omitted, the channel reports `false`.
+The emulator reads the referenced switch state for `Switch.GetStatus.output` and routes `Switch.Set` and `Switch.Toggle` to that switch. If `output_switch` is omitted, `Switch.GetStatus` reports the last state requested through `Switch.Set` or `Switch.Toggle`; it starts as `false` after boot.
 
