@@ -37,6 +37,10 @@ static constexpr char RX_CONTROL_CHAR_UUID[] = "5f6d4f53-5f52-5043-5f72-785f6374
 static constexpr uint32_t MAX_RPC_FRAME = 4096;
 static constexpr int64_t BLE_ROTATION_INTERVAL_US = 5000000;
 static constexpr int64_t BLE_AD_RESTART_DELAY_US = 100000;
+static constexpr int64_t BLE_STOP_TIMEOUT_US = 2000000;
+static constexpr int8_t BLE_STOP_RESULT_PENDING = 0;
+static constexpr int8_t BLE_STOP_RESULT_SUCCESS = 1;
+static constexpr int8_t BLE_STOP_RESULT_FAILED = -1;
 
 static esp_err_t log_http_peer(httpd_handle_t, int sockfd) {
   sockaddr_in peer{};
@@ -276,9 +280,10 @@ void ShellyEmulator::gap_event_handler(esp_gap_ble_cb_event_t event, esp_ble_gap
   if (event != ESP_GAP_BLE_ADV_STOP_COMPLETE_EVT || param == nullptr) return;
   if (param->adv_stop_cmpl.status != ESP_BT_STATUS_SUCCESS) {
     ESP_LOGW(TAG, "BLE advertising stop failed: %d", param->adv_stop_cmpl.status);
+    this->ble_stop_result_.store(BLE_STOP_RESULT_FAILED, std::memory_order_release);
     return;
   }
-  this->ble_stop_complete_.store(true, std::memory_order_release);
+  this->ble_stop_result_.store(BLE_STOP_RESULT_SUCCESS, std::memory_order_release);
 }
 
 void ShellyEmulator::handle_ble_write_(std::span<const uint8_t> data) {
@@ -476,7 +481,8 @@ void ShellyEmulator::loop() {
         this->ble_rotation_pending_.exchange(false, std::memory_order_acq_rel)) {
       this->ble_identity_change_pending_ = true;
       if (!this->ble_advertising_paused_) {
-        this->ble_stop_complete_.store(false, std::memory_order_relaxed);
+        this->ble_stop_result_.store(BLE_STOP_RESULT_PENDING, std::memory_order_relaxed);
+        this->ble_stop_requested_at_us_ = now;
         this->ble_stop_complete_at_us_ = 0;
         this->ble_advertising_paused_ = true;
         esp32_ble::global_ble->advertising_stop();
@@ -486,11 +492,33 @@ void ShellyEmulator::loop() {
     if (connected > 0 && this->ble_identity_change_pending_)
       this->ble_identity_change_pending_ = false;
 
-    const bool ble_stop_complete =
-        this->ble_stop_complete_.load(std::memory_order_acquire);
+    const int8_t ble_stop_result =
+        this->ble_stop_result_.load(std::memory_order_acquire);
+    const bool ble_stop_timed_out =
+        this->ble_advertising_paused_ &&
+        ble_stop_result == BLE_STOP_RESULT_PENDING &&
+        this->ble_stop_requested_at_us_ != 0 &&
+        now >= this->ble_stop_requested_at_us_ + BLE_STOP_TIMEOUT_US;
+    if (this->ble_advertising_paused_ &&
+        (ble_stop_result == BLE_STOP_RESULT_FAILED || ble_stop_timed_out)) {
+      ESP_LOGW(TAG, "Restoring BLE advertising after stop %s",
+               ble_stop_timed_out ? "timeout" : "failure");
+      esp32_ble::global_ble->advertising_start();
+      this->ble_advertising_paused_ = false;
+      this->ble_identity_change_pending_ = false;
+      this->ble_stop_result_.store(BLE_STOP_RESULT_PENDING, std::memory_order_relaxed);
+      this->ble_stop_requested_at_us_ = 0;
+      this->ble_stop_complete_at_us_ = 0;
+      this->ble_restart_due_us_ = 0;
+      this->ble_rotation_due_us_ = now + BLE_ROTATION_INTERVAL_US;
+    }
+
+    const bool ble_stop_complete = ble_stop_result == BLE_STOP_RESULT_SUCCESS;
     if (this->ble_advertising_paused_ && this->ble_identity_change_pending_ &&
-        ble_stop_complete && this->ble_stop_complete_at_us_ == 0)
+        ble_stop_complete && this->ble_stop_complete_at_us_ == 0) {
+      this->ble_stop_requested_at_us_ = 0;
       this->ble_stop_complete_at_us_ = now;
+    }
 
     if (this->ble_advertising_paused_ && this->ble_identity_change_pending_ &&
         ble_stop_complete && this->ble_stop_complete_at_us_ != 0 &&
@@ -512,7 +540,8 @@ void ShellyEmulator::loop() {
       if (this->ble_connected_clients_.load(std::memory_order_acquire) == 0) {
         esp32_ble::global_ble->advertising_start();
         this->ble_advertising_paused_ = false;
-        this->ble_stop_complete_.store(false, std::memory_order_relaxed);
+        this->ble_stop_result_.store(BLE_STOP_RESULT_PENDING, std::memory_order_relaxed);
+        this->ble_stop_requested_at_us_ = 0;
         this->ble_stop_complete_at_us_ = 0;
         this->ble_restart_due_us_ = 0;
         this->ble_rotation_due_us_ = now + BLE_ROTATION_INTERVAL_US;

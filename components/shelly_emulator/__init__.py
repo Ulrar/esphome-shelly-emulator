@@ -131,6 +131,8 @@ def validate_config(config):
         raise cv.Invalid("shelly_emulator is only available on ESP32")
     if CORE.using_arduino:
         raise cv.Invalid("shelly_emulator requires the ESP-IDF framework")
+    if config[CONF_ENABLE_BLE]:
+        cv.require_esphome_version(2026, 11, 0)(config)
     if config[CONF_ENABLE_BLE] and CONF_BLE_SERVER_ID not in config:
         raise cv.Invalid("ble_server_id is required when enable_ble is true")
     if not config[CONF_ENABLE_BLE] and CONF_BLE_SERVER_ID in config:

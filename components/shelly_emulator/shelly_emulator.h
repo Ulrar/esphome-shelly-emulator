@@ -168,7 +168,8 @@ class ShellyEmulator : public Component {
   int64_t ble_restart_due_us_{0};
   bool ble_advertising_paused_{false};
   bool ble_identity_change_pending_{false};
-  std::atomic<bool> ble_stop_complete_{false};
+  std::atomic<int8_t> ble_stop_result_{BLE_STOP_RESULT_PENDING};
+  int64_t ble_stop_requested_at_us_{0};
   int64_t ble_stop_complete_at_us_{0};
 #endif
 };

@@ -34,7 +34,7 @@ Make sure each referenced sensor has an `id`. Power is in watts, voltage in volt
 
 ## Emulating multiple Shelly devices
 
-The `devices` option creates two to four virtual Shelly devices on one ESP32. Multi-device mode requires BLE. It rotates the advertised BLE name every five seconds while idle and keeps the selected device fixed for the duration of each BLE connection. The same name is registered as an mDNS hostname, so the gateway's HTTP `Host` header selects the matching virtual device.
+The `devices` option creates two to four virtual Shelly devices on one ESP32. Multi-device mode requires BLE. BLE hostname handling requires ESPHome 2026.11.0 or newer. The emulator rotates the advertised BLE name every five seconds while idle and keeps the selected device fixed for the duration of each BLE connection. The same name is registered as an mDNS hostname, so the gateway's HTTP `Host` header selects the matching virtual device.
 
 For a single virtual device, set the optional top-level `hostname` to use one Shelly identity for BLE and mDNS. This is useful when a gateway gets the HTTP address from the device's BLE provisioning response and then connects using the Shelly hostname.
 
