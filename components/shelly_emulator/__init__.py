@@ -3,7 +3,7 @@ import esphome.config_validation as cv
 import re
 from esphome import automation
 from esphome.components.esp32 import include_builtin_idf_component
-from esphome.components import esp32_ble_server, sensor, switch
+from esphome.components import esp32_ble, esp32_ble_server, sensor, switch
 from esphome.core import CORE
 from esphome.const import CONF_ID
 
@@ -118,6 +118,14 @@ def resolve_profile(config, has_switch_trigger=False):
     return profile
 
 
+def resolve_device_profile(config, device):
+    has_switch_trigger = (
+        bool(config.get(CONF_ON_SWITCH_STATE))
+        and device[CONF_PROFILE] != "em_gen3"
+    )
+    return resolve_profile(device, has_switch_trigger)
+
+
 def validate_config(config):
     if not CORE.is_esp32:
         raise cv.Invalid("shelly_emulator is only available on ESP32")
@@ -152,7 +160,7 @@ def validate_config(config):
         for device in devices:
             if len(device[CONF_CHANNELS]) not in (1, 2, 4):
                 raise cv.Invalid("Each device must have 1, 2, or 4 channels")
-            resolve_profile(device, bool(config.get(CONF_ON_SWITCH_STATE)))
+            resolve_device_profile(config, device)
     else:
         if CONF_CHANNELS in config:
             if any(key in config for key in legacy_sensor_keys):
@@ -178,6 +186,10 @@ async def to_code(config):
         ble_server = await cg.get_variable(config[CONF_BLE_SERVER_ID])
         cg.add(var.set_ble_server(ble_server))
         cg.add(var.set_ble_enabled(True))
+        if CONF_DEVICES in config:
+            ble_config = CORE.config["esp32_ble"]
+            ble_component = await cg.get_variable(ble_config[CONF_ID])
+            esp32_ble.register_gap_event_handler(ble_component, var)
     devices = config.get(CONF_DEVICES)
     if devices is None:
         channels = config.get(CONF_CHANNELS)
@@ -210,7 +222,7 @@ async def to_code(config):
         cg.add(var.set_device_hostname(device_index, device[CONF_HOSTNAME]))
         cg.add(var.set_device_wifi_ssid(device_index, device[CONF_WIFI_SSID]))
         cg.add(var.set_device_channel_count(device_index, len(device[CONF_CHANNELS])))
-        cg.add(var.set_device_em_gen3(device_index, resolve_profile(device, bool(config.get(CONF_ON_SWITCH_STATE))) == "em_gen3"))
+        cg.add(var.set_device_em_gen3(device_index, resolve_device_profile(config, device) == "em_gen3"))
         for channel_index, channel in enumerate(device[CONF_CHANNELS]):
             for key, setter in (
                 (CONF_POWER_SENSOR, "set_channel_power_sensor"),

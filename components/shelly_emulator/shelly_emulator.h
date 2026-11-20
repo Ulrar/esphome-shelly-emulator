@@ -50,6 +50,7 @@ class ShellyEmulator : public Component {
 #ifdef USE_SHELLY_EMULATOR_BLE
   void set_ble_server(esp32_ble_server::BLEServer *server) { this->ble_server_ = server; }
   void set_ble_enabled(bool enabled) { this->ble_enabled_ = enabled; }
+  void gap_event_handler(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param_t *param);
 #endif
   void set_device_count(uint8_t count) { this->devices_.resize(count); }
   void set_device_name(uint8_t device, const std::string &name) {
@@ -166,6 +167,9 @@ class ShellyEmulator : public Component {
   int64_t ble_rotation_due_us_{0};
   int64_t ble_restart_due_us_{0};
   bool ble_advertising_paused_{false};
+  bool ble_identity_change_pending_{false};
+  bool ble_stop_complete_{false};
+  int64_t ble_stop_complete_at_us_{0};
 #endif
 };
 

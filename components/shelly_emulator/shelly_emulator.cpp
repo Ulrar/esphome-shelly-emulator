@@ -208,6 +208,11 @@ void ShellyEmulator::setup_ble_() {
       this->mark_failed();
       return;
     }
+    auto *ble = esp32_ble::global_ble;
+    auto &device = this->devices_[0];
+    ble->set_name(device.hostname.c_str());
+    char name_buffer[esp32_ble::ESP32BLE::DEVICE_NAME_BUFFER_SIZE]{};
+    device.effective_hostname = ble->device_name(name_buffer);
     this->set_ble_device_name_(0);
   }
   this->ble_server_->set_advertising_required(true);
@@ -265,6 +270,18 @@ void ShellyEmulator::setup_ble_() {
   this->data_char_->on_write([this](std::span<const uint8_t> data, uint16_t) {
     this->handle_ble_write_(data);
   });
+}
+
+void ShellyEmulator::gap_event_handler(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param_t *param) {
+  if (event != ESP_GAP_BLE_ADV_STOP_COMPLETE_EVT || param == nullptr ||
+      !this->ble_advertising_paused_)
+    return;
+  if (param->adv_stop_cmpl.status != ESP_BT_STATUS_SUCCESS) {
+    ESP_LOGW(TAG, "BLE advertising stop failed: %d", param->adv_stop_cmpl.status);
+    return;
+  }
+  this->ble_stop_complete_ = true;
+  this->ble_stop_complete_at_us_ = esp_timer_get_time();
 }
 
 void ShellyEmulator::handle_ble_write_(std::span<const uint8_t> data) {
@@ -452,38 +469,57 @@ void ShellyEmulator::loop() {
       this->ble_server_->is_running() && esp32_ble::global_ble != nullptr) {
     const int64_t now = esp_timer_get_time();
     const uint8_t connected = this->ble_connected_clients_.load(std::memory_order_acquire);
-    if (connected == 0 && this->ble_rotation_pending_.exchange(false, std::memory_order_acq_rel)) {
+    if (this->ble_rotation_due_us_ == 0)
+      this->ble_rotation_due_us_ = now + BLE_ROTATION_INTERVAL_US;
+    if (connected == 0 && !this->ble_advertising_paused_ &&
+        now >= this->ble_rotation_due_us_)
+      this->ble_rotation_pending_.store(true, std::memory_order_release);
+
+    if (connected == 0 &&
+        this->ble_rotation_pending_.exchange(false, std::memory_order_acq_rel)) {
       if (!this->ble_advertising_paused_) {
         esp32_ble::global_ble->advertising_stop();
         this->ble_advertising_paused_ = true;
+        this->ble_stop_complete_ = false;
+        this->ble_stop_complete_at_us_ = 0;
       }
-      const uint8_t current = this->ble_advertised_device_.load(std::memory_order_acquire);
-      const uint8_t next = static_cast<uint8_t>((current + 1) % this->devices_.size());
-      this->set_ble_device_name_(next);
-      this->ble_advertised_device_.store(next, std::memory_order_release);
-      this->ble_restart_due_us_ = now + BLE_AD_RESTART_DELAY_US;
-      this->ble_rotation_due_us_ = now + BLE_ROTATION_INTERVAL_US;
+      this->ble_identity_change_pending_ = true;
     }
-    if (this->ble_rotation_due_us_ == 0)
-      this->ble_rotation_due_us_ = now + BLE_ROTATION_INTERVAL_US;
-    if (connected == 0 && this->ble_advertising_paused_ && now >= this->ble_restart_due_us_) {
+
+    if (connected > 0 && this->ble_identity_change_pending_)
+      this->ble_identity_change_pending_ = false;
+
+    if (this->ble_advertising_paused_ && this->ble_identity_change_pending_ &&
+        this->ble_stop_complete_ && this->ble_stop_complete_at_us_ != 0 &&
+        now >= this->ble_stop_complete_at_us_ + BLE_AD_RESTART_DELAY_US) {
+      if (this->ble_connected_clients_.load(std::memory_order_acquire) == 0) {
+        const uint8_t current = this->ble_advertised_device_.load(std::memory_order_acquire);
+        const uint8_t next = static_cast<uint8_t>((current + 1) % this->devices_.size());
+        this->set_ble_device_name_(next);
+        this->ble_advertised_device_.store(next, std::memory_order_release);
+        this->ble_identity_change_pending_ = false;
+        this->ble_restart_due_us_ = now + BLE_AD_RESTART_DELAY_US;
+      } else {
+        this->ble_identity_change_pending_ = false;
+      }
+    }
+
+    if (this->ble_advertising_paused_ && !this->ble_identity_change_pending_ &&
+        this->ble_restart_due_us_ != 0 && now >= this->ble_restart_due_us_) {
       if (this->ble_connected_clients_.load(std::memory_order_acquire) == 0) {
         esp32_ble::global_ble->advertising_start();
         this->ble_advertising_paused_ = false;
+        this->ble_stop_complete_ = false;
+        this->ble_stop_complete_at_us_ = 0;
+        this->ble_restart_due_us_ = 0;
+        this->ble_rotation_due_us_ = now + BLE_ROTATION_INTERVAL_US;
+      } else {
+        this->ble_restart_due_us_ = 0;
       }
-      this->ble_restart_due_us_ = 0;
-    } else if (connected == 0 && !this->ble_advertising_paused_ && now >= this->ble_rotation_due_us_) {
-      esp32_ble::global_ble->advertising_stop();
-      this->ble_advertising_paused_ = true;
-      const uint8_t current = this->ble_advertised_device_.load(std::memory_order_acquire);
-      const uint8_t next = static_cast<uint8_t>((current + 1) % this->devices_.size());
-      this->set_ble_device_name_(next);
-      this->ble_advertised_device_.store(next, std::memory_order_release);
-      this->ble_restart_due_us_ = now + BLE_AD_RESTART_DELAY_US;
-      this->ble_rotation_due_us_ = now + BLE_ROTATION_INTERVAL_US;
     }
   }
 #endif
+
   esp_netif_ip_info_t info{};
   const bool has_ip = get_netif_ip(active_netif(), &info);
   const uint32_t current_ip = has_ip ? info.ip.addr : 0;
@@ -548,8 +584,6 @@ void ShellyEmulator::set_ble_device_name_(uint8_t device) {
 
   auto *ble = esp32_ble::global_ble;
   ble->set_name(virtual_device.hostname.c_str());
-  char name_buffer[esp32_ble::ESP32BLE::DEVICE_NAME_BUFFER_SIZE]{};
-  virtual_device.effective_hostname = ble->device_name(name_buffer);
   if (this->ble_server_ != nullptr && this->ble_server_->is_running()) {
     const esp_err_t err = esp_ble_gap_set_device_name(virtual_device.effective_hostname.c_str());
     if (err != ESP_OK) ESP_LOGW(TAG, "Could not update BLE device name: %s", esp_err_to_name(err));
